@@ -23,7 +23,6 @@ import time
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 import httpx
@@ -44,8 +43,10 @@ _IBKR_FLEX_SEND_URL = (
     "https://ndcdyn.interactivebrokers.com/AccountManagement/"
     "FlexWebService/SendRequest"
 )
-_IBKR_FLEX_HOST = "ndcdyn.interactivebrokers.com"
-_IBKR_FLEX_REPORT_PATH = "/AccountManagement/FlexWebService/GetStatement"
+_IBKR_FLEX_REPORT_URL = (
+    "https://ndcdyn.interactivebrokers.com/AccountManagement/"
+    "FlexWebService/GetStatement"
+)
 _IBKR_FLEX_USER_AGENT = "Python/3 parsec-market-brief/1.0"
 _IBKR_FLEX_TRANSIENT_CODES = {
     "1001", "1003", "1004", "1005", "1006", "1007", "1008", "1009",
@@ -176,20 +177,15 @@ def fetch_ibkr_flex_xml(
         if _xml_text(root, "Status").casefold() != "success":
             raise IBKRFlexError(_safe_flex_error(root, secrets))
         reference = _xml_text(root, "ReferenceCode")
-        report_url = _xml_text(root, "url")
-        if not reference or not report_url:
+        if not reference:
             raise IBKRFlexError(
-                "IBKR Flex success response omitted its retrieval details."
+                "IBKR Flex success response omitted its reference code."
             )
-        parsed_url = urlparse(report_url)
-        if (
-            parsed_url.scheme.casefold() != "https"
-            or (parsed_url.hostname or "").casefold() != _IBKR_FLEX_HOST
-            or parsed_url.path != _IBKR_FLEX_REPORT_PATH
-        ):
-            raise IBKRFlexError(
-                "IBKR Flex returned an unexpected retrieval endpoint."
-            )
+
+        # Do not follow the server-supplied URL. IBKR may vary that value,
+        # while trusting it would also create an avoidable SSRF surface. Poll
+        # only the documented, pinned HTTPS GetStatement endpoint.
+        report_url = _IBKR_FLEX_REPORT_URL
 
         poll_secrets = (token, query_id, reference)
         for attempt in range(max_attempts):

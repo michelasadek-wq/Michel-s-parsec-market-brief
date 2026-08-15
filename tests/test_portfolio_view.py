@@ -201,6 +201,34 @@ class TestIbkrFlex:
         assert client.get.call_count == 3
         sleeper.assert_called_once_with(5)
 
+    def test_fetch_ignores_response_url_and_uses_pinned_endpoint(self):
+        def response(text):
+            item = MagicMock()
+            item.text = text
+            item.raise_for_status = MagicMock()
+            return item
+
+        send = response(
+            "<FlexStatementResponse><Status>Success</Status>"
+            "<ReferenceCode>123456</ReferenceCode>"
+            "<url>https://example.invalid/untrusted-report</url>"
+            "</FlexStatementResponse>"
+        )
+        final = response(self.REPORT)
+        client = MagicMock()
+        client.get.side_effect = [send, final]
+
+        result = portfolio_view.fetch_ibkr_flex_xml(
+            "secret-token", "secret-query", client=client
+        )
+
+        assert result == self.REPORT
+        retrieval = client.get.call_args_list[1]
+        assert retrieval.args[0] == portfolio_view._IBKR_FLEX_REPORT_URL
+        assert retrieval.kwargs["params"] == {
+            "t": "secret-token", "q": "123456", "v": "3"
+        }
+
     def test_fetch_error_redacts_secrets(self):
         failed = MagicMock()
         failed.text = (
