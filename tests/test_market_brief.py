@@ -789,3 +789,15 @@ class TestWatchlistConfig:
     def test_schedule_time_survives_a_sexagesimal_yaml_int(self):
         """Unquoted `08:00` in YAML parses as int 480 — must degrade, not crash."""
         assert config._parse_hhmm(480, "08:00") == "08:00"
+
+    @pytest.mark.parametrize("value", ["24:00", "08:60", "banana", "8:5"])
+    def test_schedule_time_rejects_invalid_values(self, value):
+        assert config._parse_hhmm(value, "08:00") == "08:00"
+
+    def test_schedule_time_is_canonical(self):
+        assert config._parse_hhmm("8:05", "08:00") == "08:05"
+
+    def test_positive_integer_setting_degrades_safely(self):
+        assert config._positive_int("bad", 25, "max_items", "market_brief") == 25
+        assert config._positive_int(0, 25, "max_items", "market_brief") == 25
+        assert config._positive_int("12", 25, "max_items", "market_brief") == 12

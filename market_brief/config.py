@@ -84,10 +84,13 @@ def _parse_hhmm(value, default: str = "08:00") -> str:
     field's default instead of crashing whatever schedules the run.
     """
     s = str(value).strip()
-    if ":" not in s:
-        logger.warning(f"Invalid HH:MM config value {value!r}; using {default!r}")
-        return default
-    return s
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+    if match:
+        hour, minute = (int(part) for part in match.groups())
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return f"{hour:02d}:{minute:02d}"
+    logger.warning(f"Invalid HH:MM config value {value!r}; using {default!r}")
+    return default
 
 
 def _trigger_list(raw, label: str) -> list[str]:
@@ -162,6 +165,16 @@ def _optional_float(value, field: str, label: str) -> float | None:
     except (TypeError, ValueError):
         logger.warning("%s: invalid %s %r; ignoring it", label, field, value)
         return None
+
+
+def _positive_int(value, default: int, field: str, label: str) -> int:
+    """Parse a positive integer setting without making import-time config fatal."""
+    parsed = _optional_float(value, field, label)
+    if parsed is None or parsed < 1:
+        if parsed is not None:
+            logger.warning("%s: %s must be positive; using %s", label, field, default)
+        return default
+    return int(parsed)
 
 
 def _string_list(value) -> list[str]:
@@ -324,7 +337,9 @@ MARKET_BRIEF_WATCHLIST: list[dict] = _watchlist_entries(_market_cfg.get("watchli
 MARKET_BRIEF_MACRO_KEYWORDS: list[str] = _trigger_list(
     _market_cfg.get("macro_keywords", []), "market_brief.macro_keywords"
 )
-MARKET_BRIEF_MAX_ITEMS: int = int(_market_cfg.get("max_items", 25))
+MARKET_BRIEF_MAX_ITEMS: int = _positive_int(
+    _market_cfg.get("max_items", 25), 25, "max_items", "market_brief"
+)
 
 # Institutional 13F trackers (SEC EDGAR). Quarterly cadence, so this is nearly
 # always a no-op. SEC blocks requests without a contact address in the
@@ -375,19 +390,19 @@ PORTFOLIO_VIEW_DEPLOYABLE_CASH: float = max(
         "portfolio_view",
     ) or 0.0,
 )
-PORTFOLIO_VIEW_MAX_POSITION_PCT: float = max(
-    1.0, _optional_float(
+PORTFOLIO_VIEW_MAX_POSITION_PCT: float = min(
+    100.0, max(1.0, _optional_float(
         _view_cfg.get("max_position_pct", 20),
         "max_position_pct",
         "portfolio_view",
-    ) or 20.0,
+    ) or 20.0),
 )
-PORTFOLIO_VIEW_MAX_SECTOR_PCT: float = max(
-    1.0, _optional_float(
+PORTFOLIO_VIEW_MAX_SECTOR_PCT: float = min(
+    100.0, max(1.0, _optional_float(
         _view_cfg.get("max_sector_pct", 35),
         "max_sector_pct",
         "portfolio_view",
-    ) or 35.0,
+    ) or 35.0),
 )
 PORTFOLIO_VIEW_MIN_BUY_SCORE: int = int(
     _optional_float(
@@ -395,6 +410,12 @@ PORTFOLIO_VIEW_MIN_BUY_SCORE: int = int(
         "min_buy_score",
         "portfolio_view",
     ) or 3
+)
+PORTFOLIO_VIEW_MAX_SNAPSHOT_AGE_DAYS: int = _positive_int(
+    _view_cfg.get("max_snapshot_age_days", 3),
+    3,
+    "max_snapshot_age_days",
+    "portfolio_view",
 )
 
 

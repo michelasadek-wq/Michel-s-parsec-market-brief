@@ -59,7 +59,10 @@ def _parse_args(argv=None):
 
 
 async def _run(args) -> int:
-    run_brief = args.once or args.all or not (args.view or args.all)
+    requested_brief = args.once or args.all or not (args.view or args.all)
+    requested_view = args.view or args.all
+    run_brief = requested_brief and config.MARKET_BRIEF_ENABLED
+    run_view = requested_view and config.PORTFOLIO_VIEW_ENABLED
     if run_brief and config.MARKET_BRIEF_WATCHLIST:
         runner = None
         if not args.no_compose:
@@ -69,7 +72,7 @@ async def _run(args) -> int:
         if not text:
             print("Nothing to report in the market brief today.")
 
-    if args.view or args.all:
+    if run_view:
         from . import portfolio_view
         await portfolio_view.run_and_notify()
     return 0
@@ -79,12 +82,35 @@ def main(argv=None) -> int:
     args = _parse_args(argv)
     _configure_logging(args.verbose)
 
-    run_brief = args.once or args.all or not (args.view or args.all)
-    run_view = args.view or args.all
+    requested_brief = args.once or args.all or not (args.view or args.all)
+    requested_view = args.view or args.all
+    run_brief = requested_brief and config.MARKET_BRIEF_ENABLED
+    run_view = requested_view and config.PORTFOLIO_VIEW_ENABLED
+    disabled = []
+    if requested_brief and not config.MARKET_BRIEF_ENABLED:
+        disabled.append("market_brief.enabled")
+    if requested_view and not config.PORTFOLIO_VIEW_ENABLED:
+        disabled.append("portfolio_view.enabled")
+    if disabled and not (run_brief or run_view):
+        print(
+            "Requested report is disabled — set " + " and ".join(disabled)
+            + " to true in config.yaml.",
+            file=sys.stderr,
+        )
+        return 2
+    if disabled:
+        print(
+            "Skipping disabled report(s): " + ", ".join(disabled) + ".",
+            file=sys.stderr,
+        )
+
     has_view_input = bool(
         config.PORTFOLIO_VIEW_POSITIONS
         or config.PORTFOLIO_VIEW_CANDIDATES
-        or config.PORTFOLIO_VIEW_IBKR_CSV
+        or (
+            config.PORTFOLIO_VIEW_IBKR_CSV
+            and config.PORTFOLIO_VIEW_IBKR_CSV.exists()
+        )
     )
     if run_brief and not config.MARKET_BRIEF_WATCHLIST and not run_view:
         print(
@@ -95,9 +121,14 @@ def main(argv=None) -> int:
         )
         return 2
     if run_view and not has_view_input:
+        configured_path = config.PORTFOLIO_VIEW_IBKR_CSV
+        if configured_path and not configured_path.exists():
+            detail = f" Configured CSV does not exist: {configured_path}."
+        else:
+            detail = ""
         print(
             "Portfolio View has no input — set portfolio_view.ibkr_csv or add "
-            "portfolio_view.positions in config.yaml.",
+            "portfolio_view.positions in config.yaml." + detail,
             file=sys.stderr,
         )
         return 2

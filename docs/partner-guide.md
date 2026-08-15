@@ -60,6 +60,7 @@ portfolio_view:
   ibkr_csv: "data/ibkr-activity.csv"
   base_currency: "USD"
   deployable_cash: 0
+  max_snapshot_age_days: 3
 ```
 
 Then run:
@@ -70,6 +71,10 @@ python -m market_brief --view
 
 The app accepts no IBKR username, password, token or live session. A future
 read-only Flex adapter is a roadmap item, not a hidden capability.
+
+The report displays the statement date when IBKR supplies one and otherwise
+labels the CSV file-modified date. A snapshot older than the configured limit
+forces HOLD and prevents cash deployment.
 
 ---
 
@@ -99,6 +104,10 @@ Do not commit real quantities, average costs, account identifiers or exports.
 - No private portfolio values in the brief archive.
 - No guessed price, FX rate or fundamental.
 - Missing valuation/growth data defaults to HOLD.
+- Missing FX or market value makes the account total unavailable and blocks
+  allocation-dependent recommendations.
+- Position and sector limits are hard constraints on cash deployment, including
+  shared capacity across multiple candidates in the same sector.
 - 13F filings are delayed disclosures, not current-manager intent.
 - Monitoring prose cannot inherit calls from the portfolio-view module.
 - Model debate is not used; factual disagreement should fall back to static

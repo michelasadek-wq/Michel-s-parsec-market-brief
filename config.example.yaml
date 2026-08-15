@@ -61,6 +61,7 @@ portfolio_view:
   max_position_pct: 20
   max_sector_pct: 35
   min_buy_score: 3
+  max_snapshot_age_days: 3     # stale holdings force HOLD and block deployment
 
   # Use these metadata rows to classify IBKR CSV holdings. If no CSV is used,
   # quantity and average_cost make them standalone positions. Never commit your

@@ -32,6 +32,8 @@ changes the context for a configured holding, factor or research candidate.
 | Direct read-only IBKR sync | Not shipped | No credential or token surface exists. CSV is the privacy-first path. |
 | Fundamentals depth | Partial | Public quote fields degrade cleanly; margins, revisions and forward calendars need stronger sources. |
 | ETF look-through / overlap | Not shipped | Current factor tags are user-supplied; fund constituent overlap is not yet calculated. |
+| Correctness hardening | Shipped | CSV metadata survives broker merges; incomplete FX/value and stale snapshots block calls; position and shared sector caps constrain deployment. |
+| Continuous integration | Shipped | GitHub Actions runs the offline suite for pushes and pull requests. |
 
 ---
 

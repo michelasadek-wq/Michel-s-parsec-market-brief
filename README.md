@@ -130,6 +130,7 @@ portfolio_view:
   deployable_cash: 500
   max_position_pct: 20
   max_sector_pct: 35
+  max_snapshot_age_days: 3
 ```
 
 The parser recognises IBKR's sectioned `Open Positions,Header` and
@@ -166,6 +167,9 @@ Config metadata is merged into matching CSV positions, which lets the broker
 remain the source for quantity/cost/value while config provides sector, region
 and factor classifications.
 
+Both report sections honour their `enabled` switch. A configured CSV path that
+does not exist is a CLI error instead of a successful empty report.
+
 Do not commit `config.yaml` or an IBKR export. Keep only
 `config.example.yaml` in version control.
 
@@ -176,9 +180,10 @@ Do not commit `config.yaml` or an IBKR export. Keep only
 The report follows the comprehensive portfolio review contract:
 
 1. **Portfolio snapshot** — securities value, deployable cash, daily P&L,
-   unrealized P&L, realized P&L and total profit to date. Total profit is shown
-   only when both realized and unrealized inputs are complete.
-2. **Every holding** — value, weight, day and lifetime P&L, trailing/forward
+   unrealized P&L, realized P&L and their combined supplied total. The combined
+   figure is shown only when both inputs are complete; it is not presented as
+   TWR, MWR or guaranteed lifetime performance.
+2. **Every holding** — value, weight, daily and open-position P&L, trailing/forward
    P/E, PEG, earnings-growth estimate, price versus 50/200-day averages and
    distance from the 52-week high.
 3. **Exposure** — sector, region, asset class themes/factors, top-three
@@ -212,6 +217,10 @@ not be compared on P/E alone.
 - The market brief stays monitoring-only and cannot copy portfolio-view calls.
 - IBKR Daily View recommendations are a rules screen, never an automatic order.
 - Missing data is labelled unavailable; no FX, price or fundamental is guessed.
+- Incomplete account value blocks allocation percentages, BUY/SELL calls and
+  cash deployment instead of silently omitting positions.
+- CSV snapshot dates are shown; stale snapshots force HOLD under the configured
+  maximum-age rule.
 - 13F filings are backward-looking and may arrive up to 45 days after quarter
   end. They are never treated as current holdings or a signal to imitate.
 

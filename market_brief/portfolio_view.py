@@ -18,7 +18,7 @@ import csv
 import logging
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -62,7 +62,16 @@ _CSV_ALIASES = {
     "realized_pnl": ("realized p/l", "realized pnl", "realized profit/loss"),
     "asset_class": ("asset category", "asset class", "security type"),
     "account": ("account", "account id", "accountid"),
+    "as_of": (
+        "as of", "as of date", "report date", "reportdate", "position date",
+        "statement date", "date",
+    ),
 }
+
+_DATE_FORMATS = (
+    "%Y-%m-%d", "%Y%m%d", "%m/%d/%Y", "%d/%m/%Y",
+    "%B %d, %Y", "%b %d, %Y",
+)
 
 
 def _normalise_key(value: str) -> str:
@@ -95,6 +104,52 @@ def _row_value(row: dict, aliases: tuple[str, ...]):
     return None
 
 
+def _date_value(value) -> str:
+    """Return an ISO date from common IBKR date and statement-period values."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    candidates = re.findall(
+        r"\d{4}-\d{2}-\d{2}|\d{8}|\d{1,2}/\d{1,2}/\d{4}|"
+        r"[A-Za-z]+\s+\d{1,2},\s+\d{4}",
+        text,
+    ) or [text]
+    # A statement period normally contains two dates; the closing date is the
+    # position snapshot that matters, so inspect matches from right to left.
+    for candidate in reversed(candidates):
+        for fmt in _DATE_FORMATS:
+            try:
+                return datetime.strptime(candidate, fmt).date().isoformat()
+            except ValueError:
+                continue
+    return ""
+
+
+def _statement_snapshot_date(rows: list[list[str]]) -> str:
+    """Extract the closing date from an IBKR Statement metadata section."""
+    allowed_fields = {
+        "period", "statement period", "report date", "reportdate",
+        "statement date", "as of", "as of date", "to date",
+    }
+    dates = []
+    for values in rows:
+        if len(values) < 4:
+            continue
+        section = _normalise_key(values[0])
+        kind = _normalise_key(values[1])
+        field = _normalise_key(values[2])
+        if section not in {"statement", "account information"} or kind != "data":
+            continue
+        if field not in allowed_fields:
+            continue
+        parsed = _date_value(values[3])
+        if parsed:
+            dates.append(parsed)
+    return max(dates) if dates else ""
+
+
 def _normalise_broker_row(row: dict, source: str) -> dict | None:
     symbol = str(_row_value(row, _CSV_ALIASES["symbol"]) or "").strip()
     if not symbol:
@@ -108,12 +163,9 @@ def _normalise_broker_row(row: dict, source: str) -> dict | None:
             _row_value(row, _CSV_ALIASES["asset_class"]) or "Equity"
         ).strip(),
         "account": str(_row_value(row, _CSV_ALIASES["account"]) or "").strip(),
-        "sector": "Unclassified",
-        "region": "Unclassified",
-        "factors": [],
         "watch_only": False,
         "data_source": source,
-        "as_of": "",
+        "as_of": _date_value(_row_value(row, _CSV_ALIASES["as_of"])),
     }
     for field in (
         "quantity", "average_cost", "current_price", "market_value",
@@ -146,6 +198,26 @@ def load_ibkr_csv(path: str | Path) -> list[dict]:
     if not rows:
         return []
 
+    statement_as_of = _statement_snapshot_date(rows)
+    try:
+        file_as_of = datetime.fromtimestamp(
+            path.stat().st_mtime, timezone.utc
+        ).date().isoformat()
+    except OSError:
+        file_as_of = ""
+    default_as_of = statement_as_of or file_as_of
+    default_as_of_source = (
+        "IBKR statement period" if statement_as_of else "CSV file modified time"
+    )
+
+    def stamp(parsed: dict) -> dict:
+        if parsed.get("as_of"):
+            parsed["as_of_source"] = "CSV row"
+        else:
+            parsed["as_of"] = default_as_of
+            parsed["as_of_source"] = default_as_of_source if default_as_of else "unknown"
+        return parsed
+
     output: list[dict] = []
     first = [_normalise_key(cell) for cell in rows[0]]
     if "symbol" in first or "ticker" in first:
@@ -154,7 +226,7 @@ def load_ibkr_csv(path: str | Path) -> list[dict]:
             mapping = dict(zip(headers, values))
             parsed = _normalise_broker_row(mapping, f"IBKR CSV: {path.name}")
             if parsed:
-                output.append(parsed)
+                output.append(stamp(parsed))
         return aggregate_positions(output)
 
     section_headers: dict[str, list[str]] = {}
@@ -174,7 +246,7 @@ def load_ibkr_csv(path: str | Path) -> list[dict]:
         mapping = dict(zip(headers, values))
         parsed = _normalise_broker_row(mapping, f"IBKR Activity Statement: {path.name}")
         if parsed:
-            output.append(parsed)
+            output.append(stamp(parsed))
     return aggregate_positions(output)
 
 
@@ -207,18 +279,31 @@ def aggregate_positions(rows: list[dict]) -> list[dict]:
                 if any(isinstance(v, (int, float)) for v in values)
                 else None
             )
+        dates = sorted({p.get("as_of") for p in parts if p.get("as_of")})
+        if dates:
+            # The oldest component date is the conservative freshness date for
+            # an aggregate; a newer row must not disguise an older component.
+            base["as_of"] = dates[0]
+            if len(dates) > 1:
+                base["as_of_source"] = "mixed CSV snapshot dates"
         output.append(base)
     return output
 
 
 def merge_positions(config_rows: list[dict], csv_rows: list[dict]) -> list[dict]:
     """Merge private broker numbers with config-only classification metadata."""
-    configured = {row["symbol"]: row for row in config_rows}
+    configured = {row["symbol"].casefold(): row for row in config_rows}
     merged: list[dict] = []
     for broker in csv_rows:
-        row = dict(configured.get(broker["symbol"], {}))
+        configured_row = configured.get(broker["symbol"].casefold())
+        row = dict(configured_row or {})
         for key, value in broker.items():
-            if value is not None and value != "":
+            # Broker quantities, costs and values are authoritative. Empty
+            # broker classification placeholders must not erase the user's
+            # sector/region/factor metadata.
+            if configured_row and key in {"sector", "region", "factors", "asset_class"}:
+                continue
+            if value is not None and value != "" and value != []:
                 row[key] = value
         row.setdefault("name", broker["symbol"])
         row.setdefault("sector", "Unclassified")
@@ -226,8 +311,10 @@ def merge_positions(config_rows: list[dict], csv_rows: list[dict]) -> list[dict]
         row.setdefault("factors", [])
         row["watch_only"] = False
         merged.append(row)
-    broker_symbols = {row["symbol"] for row in csv_rows}
-    merged.extend(row for row in config_rows if row["symbol"] not in broker_symbols)
+    broker_symbols = {row["symbol"].casefold() for row in csv_rows}
+    merged.extend(
+        row for row in config_rows if row["symbol"].casefold() not in broker_symbols
+    )
     return aggregate_positions(merged)
 
 
@@ -420,7 +507,7 @@ def _sum_complete(rows: list[dict], field: str) -> tuple[float, bool]:
     values = [row.get(field) for row in holdings]
     return (
         sum(value for value in values if isinstance(value, (int, float))),
-        bool(holdings) and all(isinstance(value, (int, float)) for value in values),
+        all(isinstance(value, (int, float)) for value in values),
     )
 
 
@@ -432,18 +519,19 @@ def portfolio_summary(rows: list[dict], deployable_cash: float,
     daily, daily_complete = _sum_complete(holdings, "daily_pnl_base")
     unrealized, unrealized_complete = _sum_complete(holdings, "unrealized_pnl_base")
     realized, realized_complete = _sum_complete(holdings, "realized_pnl_base")
-    account_value = market_value + deployable_cash
+    known_account_value = market_value + deployable_cash
+    account_value = known_account_value if market_complete else None
 
     for row in holdings:
         value = row.get("market_value_base")
         row["allocation_pct"] = (
             value / account_value * 100
-            if isinstance(value, (int, float)) and account_value
-            else 0.0
+            if isinstance(value, (int, float)) and account_value not in (None, 0)
+            else None
         )
 
     total_profit = None
-    if unrealized_complete and realized_complete:
+    if holdings and unrealized_complete and realized_complete:
         total_profit = unrealized + realized
     return {
         "base_currency": base_currency,
@@ -454,6 +542,8 @@ def portfolio_summary(rows: list[dict], deployable_cash: float,
         "cost_value_complete": cost_complete,
         "deployable_cash": deployable_cash,
         "account_value": account_value,
+        "known_account_value": known_account_value,
+        "account_value_complete": market_complete,
         "daily_pnl": daily,
         "daily_pnl_complete": daily_complete,
         "unrealized_pnl": unrealized,
@@ -525,8 +615,18 @@ def technical_context(row: dict) -> str:
     return "; ".join(parts) or "trend data unavailable"
 
 
+def _snapshot_age(as_of: str) -> int | None:
+    """Calendar age of an input snapshot, or ``None`` when it is unknown."""
+    try:
+        snapshot = date.fromisoformat(as_of)
+    except (TypeError, ValueError):
+        return None
+    return max(0, (config.today() - snapshot).days)
+
+
 def score_position(row: dict, sector_pct: float, max_position_pct: float,
-                   max_sector_pct: float, min_buy_score: int) -> dict:
+                   max_sector_pct: float, min_buy_score: int,
+                   portfolio_complete: bool = True) -> dict:
     """Transparent action screen; every point is returned as a reason."""
     facts = row.get("fundamentals") or {}
     score = 0
@@ -584,23 +684,59 @@ def score_position(row: dict, sector_pct: float, max_position_pct: float,
             score -= 1
             reasons.append("price is more than 15% below the 200-day average")
 
-    allocation = row.get("allocation_pct", 0)
-    if row.get("is_holding") and allocation > max_position_pct:
+    allocation = row.get("allocation_pct")
+    position_at_limit = (
+        row.get("is_holding")
+        and isinstance(allocation, (int, float))
+        and allocation >= max_position_pct
+    )
+    sector_at_limit = sector_pct >= max_sector_pct
+    if position_at_limit:
         score -= 2
-        reasons.append(f"position is above the {max_position_pct:.0f}% concentration limit")
-    if row.get("is_holding") and sector_pct > max_sector_pct:
+        reasons.append(
+            f"position is at or above the {max_position_pct:.0f}% concentration limit"
+        )
+    if sector_at_limit:
         score -= 1
-        reasons.append(f"sector is above the {max_sector_pct:.0f}% exposure limit")
+        reasons.append(
+            f"sector is at or above the {max_sector_pct:.0f}% exposure limit"
+        )
 
-    if data_points < 2:
+    critical = []
+    if not row.get("quote_ok"):
+        critical.append("current quote is unavailable")
+    if not portfolio_complete:
+        critical.append("portfolio value is incomplete; concentration cannot be assessed")
+    if row.get("snapshot_stale"):
+        critical.append("the portfolio snapshot is stale")
+    if row.get("is_holding") and row.get("market_value_base") is None:
+        critical.append("base-currency market value is unavailable")
+
+    if critical:
+        action = "HOLD"
+        reasons.extend(critical)
+    elif data_points < 2:
         action = "HOLD"
         reasons.append("fewer than two valuation/growth/technical data points")
-    elif score >= min_buy_score and allocation <= max_position_pct:
-        action = "BUY"
     elif score <= -2:
         action = "SELL"
+    elif (
+        score >= min_buy_score
+        and not position_at_limit
+        and not sector_at_limit
+    ):
+        action = "BUY"
     else:
         action = "HOLD"
+    priority_markers = (
+        "unavailable", "incomplete", "stale", "fewer than two",
+        "at or above",
+    )
+    priority = [
+        reason for reason in reasons
+        if any(marker in reason for marker in priority_markers)
+    ]
+    reasons = priority + [reason for reason in reasons if reason not in priority]
     return {
         "action": action,
         "score": score,
@@ -610,43 +746,88 @@ def score_position(row: dict, sector_pct: float, max_position_pct: float,
 
 
 def deployment_plan(rows: list[dict], summary: dict, cash: float,
-                    max_position_pct: float) -> list[dict]:
-    """Allocate all deployable cash across BUY rows, bounded by concentration."""
-    if cash <= 0 or summary.get("account_value", 0) <= 0:
+                    max_position_pct: float,
+                    max_sector_pct: float = 100) -> list[dict]:
+    """Allocate cash across BUY rows within position and shared sector caps."""
+    account_value = summary.get("account_value")
+    if (
+        cash <= 0
+        or not summary.get("account_value_complete")
+        or not isinstance(account_value, (int, float))
+        or account_value <= 0
+    ):
         return []
-    eligible = []
-    cap_value = summary["account_value"] * max_position_pct / 100
+    eligible: list[dict] = []
+    position_cap = account_value * max_position_pct / 100
+    sector_cap = account_value * max_sector_pct / 100
+    sector_room: dict[str, float] = defaultdict(lambda: sector_cap)
+    for row in rows:
+        if not row.get("is_holding"):
+            continue
+        sector = str(row.get("sector") or "Unclassified")
+        sector_room[sector] -= row.get("market_value_base") or 0
+    for sector in list(sector_room):
+        sector_room[sector] = max(0.0, sector_room[sector])
+
     for row in rows:
         decision = row.get("decision") or {}
         if decision.get("action") != "BUY":
             continue
         current = row.get("market_value_base") or 0
-        room = max(0.0, cap_value - current)
-        if room:
+        sector = str(row.get("sector") or "Unclassified")
+        position_room = max(0.0, position_cap - current)
+        available = min(position_room, sector_room[sector])
+        if available:
             eligible.append({
                 "row": row,
-                "room": room,
+                "sector": sector,
+                "room": available,
                 "weight": max(1, decision.get("score", 1)),
                 "amount": 0.0,
             })
+
     remaining = cash
-    active = eligible
-    while remaining > 0.005 and active:
+    while remaining > 0.005:
+        active = [
+            item for item in eligible
+            if item["room"] - item["amount"] > 0.005
+            and sector_room[item["sector"]] > 0.005
+        ]
+        if not active:
+            break
         total_weight = sum(item["weight"] for item in active)
-        spent = 0.0
-        next_active = []
+        proposals = {}
         for item in active:
             proposed = remaining * item["weight"] / total_weight
             available = item["room"] - item["amount"]
-            addition = min(proposed, available)
+            proposals[id(item)] = min(proposed, available)
+
+        # A sector cap is shared by every existing holding and candidate in the
+        # sector. Scale same-sector proposals together so two candidates cannot
+        # each consume the same remaining sector capacity.
+        proposed_by_sector: dict[str, float] = defaultdict(float)
+        for item in active:
+            proposed_by_sector[item["sector"]] += proposals[id(item)]
+        for sector, proposed in proposed_by_sector.items():
+            room = sector_room[sector]
+            if proposed > room and proposed:
+                scale = room / proposed
+                for item in active:
+                    if item["sector"] == sector:
+                        proposals[id(item)] *= scale
+
+        spent = 0.0
+        spent_by_sector: dict[str, float] = defaultdict(float)
+        for item in active:
+            addition = proposals[id(item)]
             item["amount"] += addition
             spent += addition
-            if available - addition > 0.005:
-                next_active.append(item)
+            spent_by_sector[item["sector"]] += addition
         if spent <= 0.005:
             break
+        for sector, amount in spent_by_sector.items():
+            sector_room[sector] = max(0.0, sector_room[sector] - amount)
         remaining -= spent
-        active = next_active
     return [
         {
             "symbol": item["row"]["symbol"],
@@ -673,7 +854,8 @@ def _portfolio_watchlist(rows: list[dict]) -> list[dict]:
 def build_report(positions: list[dict], candidates: list[dict] | None = None,
                  *, base_currency: str = "USD", deployable_cash: float = 0,
                  max_position_pct: float = 20, max_sector_pct: float = 35,
-                 min_buy_score: int = 3, quote_fetcher=brief.fetch_quote,
+                 min_buy_score: int = 3, max_snapshot_age_days: int = 3,
+                 quote_fetcher=brief.fetch_quote,
                  fundamentals_fetcher=fetch_fundamentals,
                  fx_fetcher=fetch_fx_rate, headline_fetcher=None) -> dict:
     """Build a complete view. Injected fetchers keep every test offline."""
@@ -691,51 +873,109 @@ def build_report(positions: list[dict], candidates: list[dict] | None = None,
         key = (currency, base_currency)
         if key not in fx_cache:
             fx_cache[key] = fx_fetcher(*key)
-        analysed.append(analyse_position(
+        analysed_row = analyse_position(
             row, quote_data, facts, base_currency, fx_cache[key]
-        ))
+        )
+        age = _snapshot_age(str(row.get("as_of") or ""))
+        analysed_row["snapshot_age_days"] = age
+        analysed_row["snapshot_stale"] = (
+            age is not None and age > max_snapshot_age_days
+        )
+        analysed.append(analysed_row)
 
     summary = portfolio_summary(analysed, deployable_cash, base_currency)
     sectors = exposure(analysed, "sector")
     regions = exposure(analysed, "region")
     factors = exposure(analysed, "factors")
+    sector_allocation: dict[str, float] = {}
+    if summary["account_value_complete"] and summary["account_value"]:
+        sector_values: dict[str, float] = defaultdict(float)
+        for row in analysed:
+            if row.get("is_holding") and row.get("market_value_base") is not None:
+                sector_values[str(row.get("sector") or "Unclassified")] += row[
+                    "market_value_base"
+                ]
+        sector_allocation = {
+            name: value / summary["account_value"] * 100
+            for name, value in sector_values.items()
+        }
     for row in analysed:
         row["decision"] = score_position(
             row,
-            sectors.get(row.get("sector", "Unclassified"), 0),
+            sector_allocation.get(row.get("sector", "Unclassified"), 0),
             max_position_pct,
             max_sector_pct,
             min_buy_score,
+            portfolio_complete=summary["account_value_complete"],
         )
 
-    plan = deployment_plan(analysed, summary, deployable_cash, max_position_pct)
+    plan = deployment_plan(
+        analysed,
+        summary,
+        deployable_cash,
+        max_position_pct,
+        max_sector_pct,
+    )
     holdings = sorted(
         [row for row in analysed if row.get("is_holding")],
         key=lambda row: row.get("market_value_base") or 0,
         reverse=True,
     )
     research = [row for row in analysed if not row.get("is_holding")]
-    top_three = sum(row.get("allocation_pct", 0) for row in holdings[:3])
+    top_three = (
+        sum(row.get("allocation_pct") or 0 for row in holdings[:3])
+        if summary["account_value_complete"] else None
+    )
     invested = summary.get("securities_value") or 0
     hhi = sum(
         ((row.get("market_value_base") or 0) / invested) ** 2
         for row in holdings
-    ) if invested else 0
+    ) if invested and summary["account_value_complete"] else None
 
     warnings = []
-    if holdings and holdings[0].get("allocation_pct", 0) > max_position_pct:
+    if not summary["account_value_complete"]:
         warnings.append(
-            f"{holdings[0]['symbol']} exceeds the {max_position_pct:.0f}% position limit"
+            "account value and allocations are incomplete; recommendations "
+            "and cash deployment are held back"
         )
-    if sectors and next(iter(sectors.values())) > max_sector_pct:
-        name, pct = next(iter(sectors.items()))
-        warnings.append(f"{name} sector exposure is {pct:.1f}%")
-    if top_three > 60:
+    if (
+        holdings
+        and isinstance(holdings[0].get("allocation_pct"), (int, float))
+        and holdings[0]["allocation_pct"] >= max_position_pct
+    ):
+        warnings.append(
+            f"{holdings[0]['symbol']} is at or above the "
+            f"{max_position_pct:.0f}% position limit"
+        )
+    if sector_allocation:
+        name, pct = max(sector_allocation.items(), key=lambda item: item[1])
+        if pct >= max_sector_pct:
+            warnings.append(
+                f"{name} sector is {pct:.1f}% of account value, at or above "
+                f"the {max_sector_pct:.0f}% limit"
+            )
+    if isinstance(top_three, (int, float)) and top_three > 60:
         warnings.append(f"top three holdings are {top_three:.1f}% of account value")
     if not summary["realized_pnl_complete"]:
-        warnings.append("realized P&L is incomplete; total lifetime profit is unavailable")
+        warnings.append("realized P&L is incomplete; combined supplied P&L is unavailable")
     if any(not row.get("fx", {}).get("ok") for row in holdings):
         warnings.append("at least one non-base-currency position lacks an FX conversion")
+    stale = [row["symbol"] for row in holdings if row.get("snapshot_stale")]
+    if stale:
+        warnings.append(
+            f"portfolio snapshot is older than {max_snapshot_age_days} days for: "
+            + ", ".join(stale)
+        )
+    missing_dates = [row["symbol"] for row in holdings if not row.get("as_of")]
+    if missing_dates:
+        warnings.append(
+            "portfolio snapshot date is unavailable for: " + ", ".join(missing_dates)
+        )
+
+    snapshot_dates = sorted({row.get("as_of") for row in holdings if row.get("as_of")})
+    snapshot_sources = sorted({
+        row.get("as_of_source") for row in holdings if row.get("as_of_source")
+    })
 
     news = []
     if headline_fetcher:
@@ -753,14 +993,19 @@ def build_report(positions: list[dict], candidates: list[dict] | None = None,
 
     return {
         "as_of": config.today().isoformat(),
+        "snapshot_as_of": snapshot_dates[0] if snapshot_dates else None,
+        "snapshot_dates_mixed": len(snapshot_dates) > 1,
+        "snapshot_sources": snapshot_sources,
         "summary": summary,
         "holdings": holdings,
         "research_candidates": research,
         "sector_exposure": sectors,
+        "sector_allocation": sector_allocation,
         "region_exposure": regions,
         "factor_exposure": factors,
         "top_three_pct": top_three,
         "hhi": hhi,
+        "exposure_complete": summary["account_value_complete"],
         "warnings": warnings,
         "deployment_plan": plan,
         "headlines": news,
@@ -768,6 +1013,7 @@ def build_report(positions: list[dict], candidates: list[dict] | None = None,
             "min_buy_score": min_buy_score,
             "max_position_pct": max_position_pct,
             "max_sector_pct": max_sector_pct,
+            "max_snapshot_age_days": max_snapshot_age_days,
         },
     }
 
@@ -783,6 +1029,10 @@ def _metric(value: float | None, suffix: str = "") -> str:
     return "n/a" if value is None else f"{value:,.2f}{suffix}"
 
 
+def _percent(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}%"
+
+
 def _exposure_line(values: dict[str, float]) -> str:
     if not values:
         return "unavailable"
@@ -794,15 +1044,29 @@ def format_view(report: dict) -> str:
     summary = report["summary"]
     currency = summary["base_currency"]
     lines = [f"*IBKR DAILY VIEW — {report['as_of']}*", ""]
+    lines.append("*1. Portfolio snapshot*")
+    if summary["account_value_complete"]:
+        lines.append(
+            f"- Account value: {summary['account_value']:,.2f} {currency} "
+            f"({summary['securities_value']:,.2f} invested + "
+            f"{summary['deployable_cash']:,.2f} deployable cash)"
+        )
+    else:
+        lines.append(
+            f"- Account value: unavailable — known subtotal "
+            f"{summary['known_account_value']:,.2f} {currency}; at least one "
+            "position lacks a base-currency value"
+        )
+    snapshot = report.get("snapshot_as_of") or "unknown"
+    snapshot_note = " (mixed dates; oldest shown)" if report.get("snapshot_dates_mixed") else ""
+    snapshot_sources = ", ".join(report.get("snapshot_sources") or []) or "manual/config input"
     lines += [
-        "*1. Portfolio snapshot*",
-        f"- Account value: {summary['account_value']:,.2f} {currency} "
-        f"({summary['securities_value']:,.2f} invested + "
-        f"{summary['deployable_cash']:,.2f} deployable cash)",
+        f"- Position snapshot: {snapshot}{snapshot_note}; source: {snapshot_sources}",
         f"- Daily P&L: {_money(summary['daily_pnl'], currency, summary['daily_pnl_complete'])}",
         f"- Unrealized P&L: {_money(summary['unrealized_pnl'], currency, summary['unrealized_pnl_complete'])}",
         f"- Realized P&L: {_money(summary['realized_pnl'], currency, summary['realized_pnl_complete'])}",
-        f"- Total profit to date: {_money(summary['total_profit'], currency, summary['total_profit_complete'])}",
+        f"- Combined supplied P&L: "
+        f"{_money(summary['total_profit'], currency, summary['total_profit_complete'])}",
         "",
         "*2. Holdings — size, performance, valuation and call*",
     ]
@@ -813,7 +1077,7 @@ def format_view(report: dict) -> str:
         decision = row["decision"]
         lines.append(
             f"- {row['symbol']} — *{decision['action']}* (score {decision['score']:+d}; "
-            f"{row['allocation_pct']:.1f}%): value "
+            f"{_percent(row.get('allocation_pct'))}): value "
             f"{_money(row.get('market_value_base'), currency).lstrip('+')}; "
             f"price {_metric(row.get('price'))} {row.get('price_currency', '')}; "
             f"avg cost {_metric(row.get('average_cost'))} {row.get('currency', '')}; "
@@ -846,10 +1110,14 @@ def format_view(report: dict) -> str:
     lines += [
         "",
         "*3. Exposure and diversification*",
-        f"- Sectors: {_exposure_line(report['sector_exposure'])}",
-        f"- Regions: {_exposure_line(report['region_exposure'])}",
-        f"- Factors/themes: {_exposure_line(report['factor_exposure'])}",
-        f"- Top three: {report['top_three_pct']:.1f}% · HHI: {report['hhi']:.3f}",
+        f"- Sectors: {'partial ' if not report['exposure_complete'] else ''}"
+        f"{_exposure_line(report['sector_exposure'])}",
+        f"- Regions: {'partial ' if not report['exposure_complete'] else ''}"
+        f"{_exposure_line(report['region_exposure'])}",
+        f"- Factors/themes: {'partial ' if not report['exposure_complete'] else ''}"
+        f"{_exposure_line(report['factor_exposure'])}",
+        f"- Top three: {_percent(report.get('top_three_pct'))} · "
+        f"HHI: {_metric(report.get('hhi'))}",
         "",
         "*4. Risks and data gaps*",
     ]
@@ -881,6 +1149,11 @@ def format_view(report: dict) -> str:
                 f"- Deploy {item['amount']:,.2f} {currency} to {item['symbol']} "
                 f"({kind}; score {item['score']:+d})"
             )
+    elif summary["deployable_cash"] and not summary["account_value_complete"]:
+        lines.append(
+            "- No deployment plan: portfolio value is incomplete, so position "
+            "and sector limits cannot be enforced safely."
+        )
     elif summary["deployable_cash"]:
         lines.append("- No BUY passed the evidence and concentration rules; cash is not forced into a HOLD/SELL.")
     else:
@@ -906,6 +1179,8 @@ def format_view(report: dict) -> str:
         "trend, position size and sector concentration; it is not an order.",
         "- P/E bands are absolute, not sector-relative. PEG is meaningful only "
         "when earnings growth is positive. Missing data defaults to HOLD.",
+        "- Combined supplied P&L is realized plus unrealized P&L from the input; "
+        "it is not a time-weighted, money-weighted or guaranteed lifetime return.",
         "- This repository has no IBKR login or trade execution capability. "
         "Review data freshness and suitability before acting.",
     ]
@@ -929,6 +1204,7 @@ def build_configured_report() -> dict:
         max_position_pct=config.PORTFOLIO_VIEW_MAX_POSITION_PCT,
         max_sector_pct=config.PORTFOLIO_VIEW_MAX_SECTOR_PCT,
         min_buy_score=config.PORTFOLIO_VIEW_MIN_BUY_SCORE,
+        max_snapshot_age_days=config.PORTFOLIO_VIEW_MAX_SNAPSHOT_AGE_DAYS,
         headline_fetcher=brief.fetch_headlines,
     )
 

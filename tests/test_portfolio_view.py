@@ -1,5 +1,6 @@
 """Offline tests for the separate comprehensive IBKR Daily View."""
 
+from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -72,11 +73,14 @@ class TestIbkrCsv:
         assert rows[0]["average_cost"] == 100
         assert rows[0]["unrealized_pnl"] == 500
         assert "IBKR CSV" in rows[0]["data_source"]
+        assert rows[0]["as_of"]
+        assert rows[0]["as_of_source"] == "CSV file modified time"
 
     def test_activity_statement_open_positions_section(self, tmp_path):
         path = tmp_path / "activity.csv"
         path.write_text(
             "Statement,Header,Field Name,Field Value\n"
+            "Statement,Data,Period,\"August 1, 2026 - August 14, 2026\"\n"
             "Open Positions,Header,DataDiscriminator,Asset Category,Currency,"
             "Symbol,Quantity,Cost Price,Close Price,Value,Unrealized P/L\n"
             "Open Positions,Data,Summary,Stocks,USD,MSFT,2,400,420,840,40\n",
@@ -87,6 +91,8 @@ class TestIbkrCsv:
         assert rows[0]["symbol"] == "MSFT"
         assert rows[0]["market_value"] == 840
         assert rows[0]["asset_class"] == "Stocks"
+        assert rows[0]["as_of"] == "2026-08-14"
+        assert rows[0]["as_of_source"] == "IBKR statement period"
 
     def test_duplicate_symbols_use_weighted_average_cost(self):
         rows = portfolio_view.aggregate_positions([
@@ -101,14 +107,17 @@ class TestIbkrCsv:
         assert rows[0]["unrealized_pnl"] == 120
 
     def test_config_metadata_enriches_broker_numbers(self):
-        broker = [{
-            "symbol": "AAPL", "name": "Apple Inc", "quantity": 5,
-            "average_cost": 120, "currency": "USD", "data_source": "IBKR",
-        }]
-        merged = portfolio_view.merge_positions([_row(quantity=1)], broker)
+        broker = [portfolio_view._normalise_broker_row({
+            "Symbol": "AAPL", "Description": "Apple Inc", "Quantity": "5",
+            "Average Price": "120", "Currency": "USD",
+        }, "IBKR")]
+        merged = portfolio_view.merge_positions([
+            _row(quantity=1, asset_class="ETF")
+        ], broker)
         assert merged[0]["quantity"] == 5
         assert merged[0]["sector"] == "Technology"
         assert merged[0]["factors"] == ["Quality", "Large Cap"]
+        assert merged[0]["asset_class"] == "ETF"
 
 
 class TestCalculations:
@@ -172,7 +181,27 @@ class TestCalculations:
             fx_fetcher=failed,
         )
         assert report["holdings"][0]["market_value_base"] is None
+        assert report["summary"]["account_value"] is None
+        assert report["summary"]["account_value_complete"] is False
+        assert report["holdings"][0]["decision"]["action"] == "HOLD"
+        assert "Account value: unavailable" in portfolio_view.format_view(report)
         assert any("FX conversion" in warning for warning in report["warnings"])
+
+    def test_stale_snapshot_blocks_recommendations(self, monkeypatch):
+        monkeypatch.setattr(config, "today", lambda: date(2026, 8, 15))
+        report = portfolio_view.build_report(
+            [_row(as_of="2026-08-01")],
+            quote_fetcher=lambda _: _quote(),
+            fundamentals_fetcher=lambda _: _facts(),
+            fx_fetcher=_fx,
+            max_position_pct=100,
+            max_sector_pct=100,
+            max_snapshot_age_days=3,
+        )
+        decision = report["holdings"][0]["decision"]
+        assert decision["action"] == "HOLD"
+        assert "snapshot is stale" in " ".join(decision["reasons"])
+        assert any("older than 3 days" in warning for warning in report["warnings"])
 
     def test_exposure_and_concentration(self):
         rows = [
@@ -197,10 +226,12 @@ class TestDecisionScreen:
     def test_strong_evidence_is_buy(self):
         report = portfolio_view.build_report(
             [_row()],
+            deployable_cash=500,
             quote_fetcher=lambda _: _quote(),
             fundamentals_fetcher=lambda _: _facts(),
             fx_fetcher=_fx,
             max_position_pct=100,
+            max_sector_pct=100,
         )
         decision = report["holdings"][0]["decision"]
         assert decision["action"] == "BUY"
@@ -241,6 +272,7 @@ class TestDecisionScreen:
             [], [candidate],
             deployable_cash=500,
             max_position_pct=100,
+            max_sector_pct=100,
             quote_fetcher=lambda _: _quote("AVGO", 300, 295),
             fundamentals_fetcher=lambda _: _facts(),
             fx_fetcher=_fx,
@@ -249,6 +281,26 @@ class TestDecisionScreen:
             "symbol": "AVGO", "name": "AVGO", "amount": 500.0,
             "score": 5, "new_position": True,
         }]
+
+    def test_overweight_sector_blocks_candidate_and_cash_plan(self):
+        candidate = config._portfolio_entries([
+            {"symbol": "AVGO", "sector": "Technology"}
+        ], watch_only=True)[0]
+        report = portfolio_view.build_report(
+            [_row()], [candidate],
+            deployable_cash=1000,
+            max_position_pct=60,
+            max_sector_pct=35,
+            quote_fetcher=lambda symbol: _quote(symbol),
+            fundamentals_fetcher=lambda _: _facts(),
+            fx_fetcher=_fx,
+        )
+        decision = report["research_candidates"][0]["decision"]
+        assert report["sector_exposure"]["Technology"] == 100
+        assert decision["action"] == "HOLD"
+        assert "sector is at or above" in " ".join(decision["reasons"])
+        assert "sector is at or above" in decision["reasons"][0]
+        assert report["deployment_plan"] == []
 
 
 class TestRenderingAndDelivery:
@@ -264,7 +316,7 @@ class TestRenderingAndDelivery:
         )
         text = portfolio_view.format_view(report)
         for expected in (
-            "Portfolio snapshot", "Total profit to date", "P/E T/F", "PEG",
+            "Portfolio snapshot", "Combined supplied P&L", "P/E T/F", "PEG",
             "Exposure and diversification", "Risks and data gaps",
             "Market context and catalysts", "Actions and cash deployment",
             "BUY", "HOLD", "SELL", "Research candidates", "no IBKR login",
