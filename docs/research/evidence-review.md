@@ -10,9 +10,16 @@
 - "Profit Mirage" (arXiv 2510.07920) back-tested the popular agent frameworks (FinMem, FinAgent, QuantAgent, FinCON, TradingAgents): **Sharpe ratios decay 51–62% once tested past the models' training cutoff.**
 - FINSABER (arXiv 2505.07078), 20 years / 100+ symbols: out-of-sample LLM alpha **+20.7% → −1.0%.**
 - Large-cap news is priced into markets in **milliseconds**. A daily brief is hours late by design — anything still actionable at that cadence is context, not signal.
-- No study exists testing LLM news sentiment on Tadawul or EGX; the "thin coverage = easy alpha" story dies on transaction costs and liquidity.
+- Evidence is weakest outside the most liquid large-cap universes; lower
+  coverage does not remove transaction costs, liquidity constraints or
+  out-of-sample decay.
 
-**Design conclusion:** the value of a daily brief is *attention routing* (nothing about your holdings escapes you) and *panic prevention* — not alpha. The compose step therefore hard-forbids buy/sell/hold language, and ships a plain data digest if the model deviates.
+**Design conclusion:** the value of the monitoring brief is *attention routing*
+(nothing about your holdings escapes you) and *panic prevention* — not alpha.
+Its compose step hard-forbids buy/sell/hold language and ships a plain data
+digest if the model deviates. The separate IBKR Daily View uses a disclosed,
+deterministic portfolio screen; it does not claim that headline sentiment is an
+edge and it cannot execute an order.
 
 ## Question 2: do multiple models debating produce better analysis?
 

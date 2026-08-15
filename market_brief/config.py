@@ -94,7 +94,8 @@ def _trigger_list(raw, label: str) -> list[str]:
     """Normalise a configured keyword list: strings, stripped, lower-cased.
 
     A single string is accepted as a one-item list — the yaml is written by
-    hand and ``macro_keywords: CBE`` is the obvious mistake to survive.
+    hand and ``macro_keywords: Federal Reserve`` is the obvious mistake to
+    survive.
     """
     if isinstance(raw, str):
         raw = [raw]
@@ -115,14 +116,12 @@ def _watchlist_entries(raw, label: str = "market_brief.watchlist") -> list[dict]
     Two kinds of entry are valid:
       * priced — has a `symbol`, gets a quote and can be flagged as a mover;
       * news-only — has a `name` (and usually aliases) but no tradeable symbol
-        we trust. EGX names are the case: their Yahoo symbols are ISIN-based
-        and easy to get wrong, and a wrong symbol is worse than no symbol.
-        `news_only: true` also forces this for an entry that HAS a symbol.
+        we trust. `news_only: true` also forces this for an entry that HAS a
+        symbol. A wrong listing suffix is worse than no quote.
     An entry with neither symbol nor name means nothing at all and is dropped
     with a warning rather than crashing the scan later.
 
-    Aliases are kept as written — Arabic aliases must survive verbatim, so
-    nothing here lower-cases them; matching casefolds at compare time instead.
+    Aliases are kept as written; matching casefolds at compare time instead.
     """
     out: list[dict] = []
     if not isinstance(raw, (list, tuple)):
@@ -152,6 +151,94 @@ def _watchlist_entries(raw, label: str = "market_brief.watchlist") -> list[dict]
             "news_only": news_only,
         })
     return out
+
+
+def _optional_float(value, field: str, label: str) -> float | None:
+    """Parse an optional numeric config value without making config fatal."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("%s: invalid %s %r; ignoring it", label, field, value)
+        return None
+
+
+def _string_list(value) -> list[str]:
+    """Normalise a comma-separated string or list while preserving case."""
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+_PORTFOLIO_NUMERIC_FIELDS = (
+    "quantity", "average_cost", "current_price", "market_value",
+    "unrealized_pnl", "realized_pnl", "trailing_pe", "forward_pe", "peg",
+    "earnings_growth_pct", "revenue_growth_pct", "profit_margin_pct",
+    "debt_to_equity", "price_to_book", "dividend_yield_pct", "beta",
+    "fifty_day_average", "two_hundred_day_average", "fifty_two_week_high",
+    "fifty_two_week_low", "market_cap",
+)
+
+
+def _portfolio_entries(raw, label: str = "portfolio_view.positions",
+                       watch_only: bool = False) -> list[dict]:
+    """Normalise private portfolio rows and optional research candidates.
+
+    A row needs a symbol. Quantity and average cost are optional so a research
+    candidate can use the same schema as a holding. Fundamental fields may be
+    supplied as overrides when a public data source does not expose them.
+    """
+    if not isinstance(raw, (list, tuple)):
+        if raw:
+            logger.warning("%s ignored — expected a list of dicts, got %r", label, raw)
+        return []
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            logger.warning("%s: skipping non-dict entry %r", label, entry)
+            continue
+        symbol = str(entry.get("symbol", "")).strip()
+        if not symbol:
+            logger.warning("%s: skipping row without a symbol: %r", label, entry)
+            continue
+        row = {
+            "symbol": symbol,
+            "name": str(entry.get("name", "")).strip() or symbol,
+            "currency": str(entry.get("currency", "USD")).strip().upper() or "USD",
+            "sector": str(entry.get("sector", "Unclassified")).strip() or "Unclassified",
+            "region": str(entry.get("region", "Unclassified")).strip() or "Unclassified",
+            "asset_class": str(entry.get("asset_class", "Equity")).strip() or "Equity",
+            "account": str(entry.get("account", "")).strip(),
+            "factors": _string_list(entry.get("factors", [])),
+            "watch_only": bool(entry.get("watch_only", watch_only)) or watch_only,
+            "data_source": str(entry.get("data_source", "config")).strip() or "config",
+            "as_of": str(entry.get("as_of", "")).strip(),
+        }
+        # Accept the common IBKR/config aliases without duplicating them in the
+        # runtime model.
+        aliases = {
+            "average_cost": entry.get(
+                "average_cost", entry.get("avg_cost", entry.get("cost_basis"))
+            ),
+        }
+        for field in _PORTFOLIO_NUMERIC_FIELDS:
+            value = aliases.get(field, entry.get(field))
+            row[field] = _optional_float(value, field, label)
+        out.append(row)
+    return out
+
+
+def _optional_path(value) -> Path | None:
+    """Resolve a user-supplied data path relative to the repository root."""
+    if value is None or str(value).strip() == "":
+        return None
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
 
 
 def _tracker_entries(raw, label: str = "market_brief.trackers") -> list[dict]:
@@ -184,9 +271,9 @@ def _tracker_entries(raw, label: str = "market_brief.trackers") -> list[dict]:
 # ── time ────────────────────────────────────────────────────────────
 
 #: All dates in this app — the seen-set TTL, the 13F staleness window, the
-#: brief's own date — are market-local, not server-local. A UTC host would
-#: otherwise roll the date over at 22:00 local and dedupe against "tomorrow".
-_DEFAULT_TIMEZONE = "Africa/Cairo"
+#: brief's own date — are U.S.-market-local by default, not server-local. The
+#: timezone remains configurable for global portfolios.
+_DEFAULT_TIMEZONE = "America/New_York"
 TIMEZONE: str = str(_cfg.get("timezone", _DEFAULT_TIMEZONE)).strip() or _DEFAULT_TIMEZONE
 
 
@@ -252,6 +339,63 @@ MARKET_BRIEF_SEC_CONTACT: str = str(
 COMPOSE_MODEL: str = str(
     _market_cfg.get("compose_model", "claude-sonnet-4-6")
 ).strip() or "claude-sonnet-4-6"
+
+
+# ── IBKR Daily View ─────────────────────────────────────────────────
+
+# Separate from the terse monitoring brief. This feature calculates portfolio
+# performance, concentration, valuation/technical context, and evidence-based
+# BUY/HOLD/SELL labels. It reads a local IBKR CSV or explicit config rows and
+# never logs in to IBKR or places an order.
+_view_cfg = _cfg.get("portfolio_view", {})
+if not isinstance(_view_cfg, dict):
+    logger.warning("portfolio_view section is not a mapping; ignoring it")
+    _view_cfg = {}
+
+PORTFOLIO_VIEW_ENABLED: bool = bool(_view_cfg.get("enabled", False))
+PORTFOLIO_VIEW_SCHEDULE_TIME: str = _parse_hhmm(
+    _view_cfg.get("schedule_time", "08:15"), "08:15"
+)
+PORTFOLIO_VIEW_BASE_CURRENCY: str = str(
+    _view_cfg.get("base_currency", "USD")
+).strip().upper() or "USD"
+PORTFOLIO_VIEW_IBKR_CSV: Path | None = _optional_path(_view_cfg.get("ibkr_csv"))
+PORTFOLIO_VIEW_POSITIONS: list[dict] = _portfolio_entries(
+    _view_cfg.get("positions", []), "portfolio_view.positions"
+)
+PORTFOLIO_VIEW_CANDIDATES: list[dict] = _portfolio_entries(
+    _view_cfg.get("research_candidates", []),
+    "portfolio_view.research_candidates",
+    watch_only=True,
+)
+PORTFOLIO_VIEW_DEPLOYABLE_CASH: float = max(
+    0.0, _optional_float(
+        _view_cfg.get("deployable_cash", 0),
+        "deployable_cash",
+        "portfolio_view",
+    ) or 0.0,
+)
+PORTFOLIO_VIEW_MAX_POSITION_PCT: float = max(
+    1.0, _optional_float(
+        _view_cfg.get("max_position_pct", 20),
+        "max_position_pct",
+        "portfolio_view",
+    ) or 20.0,
+)
+PORTFOLIO_VIEW_MAX_SECTOR_PCT: float = max(
+    1.0, _optional_float(
+        _view_cfg.get("max_sector_pct", 35),
+        "max_sector_pct",
+        "portfolio_view",
+    ) or 35.0,
+)
+PORTFOLIO_VIEW_MIN_BUY_SCORE: int = int(
+    _optional_float(
+        _view_cfg.get("min_buy_score", 3),
+        "min_buy_score",
+        "portfolio_view",
+    ) or 3
+)
 
 
 # ── delivery ────────────────────────────────────────────────────────

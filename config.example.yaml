@@ -1,72 +1,91 @@
-# parsec-market-brief — example configuration.
+# parsec-market-brief — U.S.-first / global example configuration.
 #
 # Copy to config.yaml and edit. If config.yaml is absent this file is read
-# instead (with a warning), so a fresh clone runs before it is configured.
-#
-# MONITORING ONLY — the brief never carries buy/sell/hold calls or price
-# targets. The watchlist below says what to WATCH, never what to do about it.
+# instead (with a warning), so the monitoring brief works from a fresh clone.
 
-# All dates (dedup TTL, 13F staleness window, the brief's own date) are
-# resolved in this timezone, not the server's. A UTC host would otherwise roll
-# the date over at 22:00 local.
-timezone: "Africa/Cairo"
+# Market-local time for report dates and schedules. Change this if another
+# global market anchors your day.
+timezone: "America/New_York"
 
 market_brief:
   enabled: true
-  schedule_time: "08:00"      # quote the value — unquoted 08:00 is an int in YAML
-  max_items: 25               # cap on headlines carried into one brief
-
-  # Optional narrative composer. Only used when the `claude` CLI is on PATH;
-  # without it every run prints the static digest, which is the real output.
+  schedule_time: "08:00"      # quote it — unquoted 08:00 is an int in YAML
+  max_items: 25
   compose_model: "claude-sonnet-4-6"
 
-  # Institutional 13F watcher (SEC EDGAR). Quarterly cadence — silent on ~99%
-  # of days. sec_contact goes into the User-Agent that SEC requires on every
-  # request; requests without one are blocked outright.
+  # SEC 13F watcher. The contact address is required in the SEC User-Agent.
   trackers:
     - {name: "Berkshire Hathaway", cik: "0001067983"}
   sec_contact: "you@example.com"
 
+  # U.S. holdings are the centre of the brief. Major global listings use their
+  # normal Yahoo Finance exchange suffixes (examples: .L, .DE, .T, .HK, .TO,
+  # .AX). One ticker-specific Yahoo news feed is generated for every row.
   watchlist:
-    # ── Priced entries ──────────────────────────────────────────────
-    # Quoted daily, flagged when they move past their threshold (2%, or 1% for
-    # the low-beta instruments listed in brief.py).
-    - {symbol: "1180.SR", name: "Saudi National Bank", aliases: ["SNB", "الأهلي السعودي"], market: tadawul}
-    - {symbol: "7010.SR", name: "stc", aliases: ["اس تي سي", "الاتصالات السعودية"], market: tadawul}
-    - {symbol: "9412.SR", name: "Albilad MSCI Saudi Equity ETF", aliases: ["9412"], market: tadawul}
-    - {symbol: "9404.SR", name: "Alinma Govt Sukuk ETF", aliases: ["9404"], market: tadawul}
-    # EGX symbols on Yahoo are ISIN-based — "FWRY.CA" is a DIFFERENT instrument,
-    # do not "simplify" this one. It is the only EGX symbol here that is verified.
-    - {symbol: "EGS745L1C014.CA", name: "Fawry", aliases: ["FWRY", "فوري"], market: egx}
-    - {symbol: "VWRA.L", name: "Vanguard FTSE All-World (VWRA)", aliases: ["VWRA"], market: lse}
-    - {symbol: "TSM", name: "TSMC", aliases: ["Taiwan Semiconductor"], market: us}
-    - {symbol: "AVGO", name: "Broadcom", aliases: ["Broadcom"], market: us}
+    - {symbol: "QQQM", name: "Invesco NASDAQ 100 ETF", aliases: ["Nasdaq 100"], market: us}
+    - {symbol: "VTI", name: "Vanguard Total Stock Market ETF", aliases: ["VTI"], market: us}
+    - {symbol: "PWR", name: "Quanta Services", aliases: ["Quanta"], market: us}
+    - {symbol: "MU", name: "Micron Technology", aliases: ["Micron"], market: us}
+    - {symbol: "TSM", name: "Taiwan Semiconductor", aliases: ["TSMC"], market: us}
+    - {symbol: "VWRA.L", name: "Vanguard FTSE All-World UCITS ETF", aliases: ["VWRA"], market: global}
+    - {symbol: "SAP.DE", name: "SAP", aliases: ["SAP SE"], market: europe, watch_only: true}
+    - {symbol: "7203.T", name: "Toyota Motor", aliases: ["Toyota"], market: asia_pacific, watch_only: true}
 
-    # ── News-only entries ───────────────────────────────────────────
-    # Tracked in headlines, never priced. Their Yahoo symbols are ISIN-based
-    # and unverified, and a WRONG symbol is worse than no symbol: it would
-    # print a confident number for a different instrument.
-    - {name: "e-Finance", aliases: ["EFIH", "اي فاينانس"], market: egx, news_only: true}
-    - {name: "Commercial International Bank", aliases: ["COMI", "التجاري الدولي"], market: egx, news_only: true}
-    - {name: "Abu Qir Fertilizers", aliases: ["ABUK", "أبو قير"], market: egx, news_only: true}
-    - {name: "MOPCO", aliases: ["MFPC", "موبكو"], market: egx, news_only: true}
-    - {name: "EFG Holding", aliases: ["HRHO", "اي اف چي"], market: egx, news_only: true}
-    - {name: "Talaat Moustafa Group", aliases: ["TMGH", "طلعت مصطفى"], market: egx, news_only: true}
-    - {name: "Orascom Construction", aliases: ["ORAS", "أوراسكوم"], market: egx, news_only: true}
-    - {name: "Edita Food Industries", aliases: ["EFID", "إيديتا"], market: egx, news_only: true}
-    - {name: "Oriental Weavers", aliases: ["ORWE", "النساجون الشرقيون"], market: egx, news_only: true}
+  macro_keywords:
+    - "Federal Reserve"
+    - "FOMC"
+    - "US inflation"
+    - "CPI"
+    - "jobs report"
+    - "Treasury yield"
+    - "VIX"
+    - "dollar index"
+    - "oil"
+    - "ECB"
+    - "Bank of Japan"
+    - "trade tariff"
+    - "semiconductors"
+    - "AI infrastructure"
 
-  # Macro/policy terms. A headline matching one of these is kept even when it
-  # names nothing on the watchlist, but it ranks below ticker-specific news.
-  # Matching is whole-token; Arabic terms also match with the attached ال.
-  macro_keywords: ["CBE", "المركزي المصري", "Federal Reserve", "Fed rate", "Trump tariff", "TASI", "EGX30", "interest rate Egypt", "Saudi CMA", "urea", "أسمدة"]
+# Separate comprehensive portfolio decision-support report.
+#
+# It does NOT log in to IBKR and cannot place orders. Export an Activity
+# Statement CSV locally, or supply position rows. Private portfolio values are
+# never written to the market-brief archive.
+portfolio_view:
+  enabled: false
+  schedule_time: "08:15"
+  base_currency: "USD"
+  ibkr_csv: ""                  # e.g. "data/ibkr-activity.csv"
+  deployable_cash: 0            # cash you explicitly want allocated today
+  max_position_pct: 20
+  max_sector_pct: 35
+  min_buy_score: 3
 
-# Where a finished brief goes. "console" prints it (the default, and what
-# `--once` uses). "whatsapp" targets an HTTP gateway and is a documented stub —
-# see market_brief/senders.py before enabling it.
+  # Use these metadata rows to classify IBKR CSV holdings. If no CSV is used,
+  # quantity and average_cost make them standalone positions. Never commit your
+  # real private config.yaml.
+  positions: []
+  # Example (keep commented until replaced with your own data):
+  # - symbol: "QQQM"
+  #   name: "Invesco NASDAQ 100 ETF"
+  #   quantity: 10
+  #   average_cost: 210
+  #   currency: "USD"
+  #   sector: "Diversified"
+  #   region: "United States"
+  #   asset_class: "ETF"
+  #   factors: ["Growth", "Large Cap", "Technology tilt"]
+  #   realized_pnl: 0
+
+  # Non-held names evaluated by the same P/E, PEG, growth, trend and
+  # concentration screen. These never become holdings automatically.
+  research_candidates: []
+  # - {symbol: "AVGO", name: "Broadcom", currency: "USD", sector: "Semiconductors", region: "United States", factors: ["AI infrastructure"]}
+
 delivery:
   backend: "console"
   # base_url: "http://localhost:3000"
   # session: "default"
   # chat_id: "000000000000@c.us"
-  # Never put a key in this file — read it from the environment instead.
+  # Never put a delivery key in this file; read it from the environment.

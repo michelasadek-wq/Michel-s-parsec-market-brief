@@ -1,8 +1,8 @@
-"""parsec-market-brief — a daily pre-market watchlist monitor.
+"""U.S.-first/global market monitor plus a separate IBKR Daily View.
 
-Monitoring, not signals. See README.md and the guardrail notes in brief.py.
+See README.md for the distinct monitoring and portfolio decision contracts.
 """
 
 __version__ = "1.0.0"
 
-__all__ = ["brief", "config", "claude", "senders", "smart_money"]
+__all__ = ["brief", "portfolio_view", "config", "claude", "senders", "smart_money"]
