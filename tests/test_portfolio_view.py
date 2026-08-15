@@ -120,6 +120,121 @@ class TestIbkrCsv:
         assert merged[0]["asset_class"] == "ETF"
 
 
+class TestIbkrFlex:
+    REPORT = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse queryName="Daily Portfolio Monitoring">
+  <FlexStatements count="1">
+    <FlexStatement accountId="PRIVATE" fromDate="20260801" toDate="20260814">
+      <OpenPositions>
+        <OpenPosition accountId="PRIVATE" acctAlias="PRIVATE_ALIAS"
+          assetCategory="STK" currency="USD" symbol="MSFT"
+          description="Microsoft Corp" position="2" markPrice="420"
+          positionValue="840" costBasisPrice="400"
+          fifoPnlUnrealized="40" reportDate="20260814" />
+      </OpenPositions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+
+    def test_flex_xml_maps_camel_case_and_drops_account_fields(self):
+        rows = portfolio_view.load_ibkr_flex_xml(self.REPORT)
+        assert len(rows) == 1
+        assert rows[0]["symbol"] == "MSFT"
+        assert rows[0]["quantity"] == 2
+        assert rows[0]["average_cost"] == 400
+        assert rows[0]["current_price"] == 420
+        assert rows[0]["market_value"] == 840
+        assert rows[0]["unrealized_pnl"] == 40
+        assert rows[0]["as_of"] == "2026-08-14"
+        assert rows[0]["account"] == ""
+        assert "PRIVATE" not in repr(rows)
+
+    def test_flex_requires_open_positions_section(self):
+        with pytest.raises(portfolio_view.IBKRFlexError, match="Open Positions"):
+            portfolio_view.load_ibkr_flex_xml(
+                "<FlexQueryResponse><FlexStatements /></FlexQueryResponse>"
+            )
+
+    def test_summary_row_prevents_double_counting_lots(self):
+        report = """<FlexQueryResponse><FlexStatements><FlexStatement
+          toDate="20260814"><OpenPositions>
+          <OpenPosition symbol="AAPL" currency="USD" position="3"
+            costBasisPrice="110" levelOfDetail="Summary" />
+          <OpenPosition symbol="AAPL" currency="USD" position="2"
+            costBasisPrice="100" levelOfDetail="Lot" />
+          <OpenPosition symbol="AAPL" currency="USD" position="1"
+            costBasisPrice="130" levelOfDetail="Lot" />
+          </OpenPositions></FlexStatement></FlexStatements></FlexQueryResponse>"""
+        rows = portfolio_view.load_ibkr_flex_xml(report)
+        assert rows[0]["quantity"] == 3
+        assert rows[0]["average_cost"] == 110
+
+    def test_two_step_fetch_polls_transient_response(self):
+        def response(text):
+            item = MagicMock()
+            item.text = text
+            item.raise_for_status = MagicMock()
+            return item
+
+        send = response(
+            "<FlexStatementResponse><Status>Success</Status>"
+            "<ReferenceCode>123456</ReferenceCode>"
+            "<url>https://ndcdyn.interactivebrokers.com/AccountManagement/"
+            "FlexWebService/GetStatement</url></FlexStatementResponse>"
+        )
+        pending = response(
+            "<FlexStatementResponse><Status>Fail</Status>"
+            "<ErrorCode>1019</ErrorCode>"
+            "<ErrorMessage>Statement generation in progress.</ErrorMessage>"
+            "</FlexStatementResponse>"
+        )
+        final = response(self.REPORT)
+        client = MagicMock()
+        client.get.side_effect = [send, pending, final]
+        sleeper = MagicMock()
+
+        result = portfolio_view.fetch_ibkr_flex_xml(
+            "secret-token", "secret-query", client=client, sleep=sleeper
+        )
+
+        assert result == self.REPORT
+        assert client.get.call_count == 3
+        sleeper.assert_called_once_with(5)
+
+    def test_fetch_error_redacts_secrets(self):
+        failed = MagicMock()
+        failed.text = (
+            "<FlexStatementResponse><Status>Fail</Status>"
+            "<ErrorCode>1015</ErrorCode>"
+            "<ErrorMessage>bad TOKEN-VALUE for QUERY-VALUE</ErrorMessage>"
+            "</FlexStatementResponse>"
+        )
+        failed.raise_for_status = MagicMock()
+        client = MagicMock()
+        client.get.return_value = failed
+        with pytest.raises(portfolio_view.IBKRFlexError) as error:
+            portfolio_view.fetch_ibkr_flex_xml(
+                "TOKEN-VALUE", "QUERY-VALUE", client=client
+            )
+        assert "TOKEN-VALUE" not in str(error.value)
+        assert "QUERY-VALUE" not in str(error.value)
+
+    def test_live_flex_config_rows_are_metadata_only(self, monkeypatch):
+        monkeypatch.setattr(config, "PORTFOLIO_VIEW_IBKR_FLEX_ENABLED", True)
+        monkeypatch.setattr(config, "PORTFOLIO_VIEW_POSITIONS", [
+            _row(symbol="AAPL"),
+            _row(symbol="MSFT", sector="Technology", quantity=None),
+        ])
+        monkeypatch.setenv("IBKR_FLEX_TOKEN", "token")
+        monkeypatch.setenv("IBKR_FLEX_QUERY_ID", "query")
+        monkeypatch.setattr(
+            portfolio_view, "fetch_ibkr_flex_xml", lambda *_: self.REPORT
+        )
+        rows = portfolio_view.configured_positions()
+        assert [row["symbol"] for row in rows] == ["MSFT"]
+        assert rows[0]["sector"] == "Technology"
+
+
 class TestCalculations:
     def test_complete_profit_and_allocation(self):
         report = portfolio_view.build_report(

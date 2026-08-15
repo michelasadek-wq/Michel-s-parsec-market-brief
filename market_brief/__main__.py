@@ -7,6 +7,7 @@ purpose: scheduling belongs to cron, systemd timers, or the deployment layer.
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
 from . import brief, config
@@ -104,9 +105,15 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
 
+    flex_enabled = config.PORTFOLIO_VIEW_IBKR_FLEX_ENABLED
+    missing_flex_env = [
+        name for name in ("IBKR_FLEX_TOKEN", "IBKR_FLEX_QUERY_ID")
+        if flex_enabled and not os.environ.get(name, "").strip()
+    ]
     has_view_input = bool(
         config.PORTFOLIO_VIEW_POSITIONS
         or config.PORTFOLIO_VIEW_CANDIDATES
+        or (flex_enabled and not missing_flex_env)
         or (
             config.PORTFOLIO_VIEW_IBKR_CSV
             and config.PORTFOLIO_VIEW_IBKR_CSV.exists()
@@ -120,6 +127,13 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 2
+    if run_view and missing_flex_env:
+        print(
+            "IBKR Flex input is enabled but required environment variables "
+            "are missing: " + ", ".join(missing_flex_env) + ".",
+            file=sys.stderr,
+        )
+        return 2
     if run_view and not has_view_input:
         configured_path = config.PORTFOLIO_VIEW_IBKR_CSV
         if configured_path and not configured_path.exists():
@@ -127,8 +141,9 @@ def main(argv=None) -> int:
         else:
             detail = ""
         print(
-            "Portfolio View has no input — set portfolio_view.ibkr_csv or add "
-            "portfolio_view.positions in config.yaml." + detail,
+            "Portfolio View has no input — enable portfolio_view.ibkr_flex, "
+            "set portfolio_view.ibkr_csv, or add portfolio_view.positions in "
+            "config.yaml." + detail,
             file=sys.stderr,
         )
         return 2

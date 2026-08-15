@@ -1,4 +1,4 @@
-"""Comprehensive, local-first IBKR Daily View.
+"""Comprehensive, read-only IBKR Daily View.
 
 This is deliberately separate from :mod:`market_brief.brief`:
 
@@ -6,9 +6,10 @@ This is deliberately separate from :mod:`market_brief.brief`:
 * this module is a portfolio decision-support surface with transparent,
   rule-based BUY/HOLD/SELL labels and exact deployment amounts.
 
-Positions may come from a local IBKR Activity Statement CSV or from config.
-No broker credentials are requested, no order endpoint exists, and portfolio
-details are never written to the market-brief archive.
+Positions may come from a local IBKR Activity Statement CSV, a read-only Flex
+Web Service report, or config. Flex secrets are accepted only through the
+environment. No username/password is requested, no order endpoint exists, and
+portfolio details are never written to the market-brief archive.
 """
 
 from __future__ import annotations
@@ -16,10 +17,14 @@ from __future__ import annotations
 import asyncio
 import csv
 import logging
+import os
 import re
+import time
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
+from xml.etree import ElementTree
 
 import httpx
 
@@ -35,6 +40,17 @@ _YAHOO_FX_URL = (
     "?range=5d&interval=1d"
 )
 _HTTP_TIMEOUT = 15
+_IBKR_FLEX_SEND_URL = (
+    "https://ndcdyn.interactivebrokers.com/AccountManagement/"
+    "FlexWebService/SendRequest"
+)
+_IBKR_FLEX_HOST = "ndcdyn.interactivebrokers.com"
+_IBKR_FLEX_REPORT_PATH = "/AccountManagement/FlexWebService/GetStatement"
+_IBKR_FLEX_USER_AGENT = "Python/3 parsec-market-brief/1.0"
+_IBKR_FLEX_TRANSIENT_CODES = {
+    "1001", "1003", "1004", "1005", "1006", "1007", "1008", "1009",
+    "1018", "1019", "1021",
+}
 
 _NUMBER_FIELDS = {
     "quantity", "average_cost", "current_price", "market_value",
@@ -58,6 +74,7 @@ _CSV_ALIASES = {
     "market_value": ("value", "market value", "position value"),
     "unrealized_pnl": (
         "unrealized p/l", "unrealized pnl", "unrealized profit/loss",
+        "fifo pnl unrealized",
     ),
     "realized_pnl": ("realized p/l", "realized pnl", "realized profit/loss"),
     "asset_class": ("asset category", "asset class", "security type"),
@@ -75,7 +92,212 @@ _DATE_FORMATS = (
 
 
 def _normalise_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).strip()
+    # Flex XML uses camelCase attributes while CSV exports use title-cased
+    # headings. Split camelCase first so both resolve through the same aliases.
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(value))
+    return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+
+
+class IBKRFlexError(RuntimeError):
+    """A safe Flex failure whose message never contains request secrets."""
+
+
+def _xml_local_name(tag: str) -> str:
+    return str(tag).rsplit("}", 1)[-1].casefold()
+
+
+def _xml_text(root: ElementTree.Element, name: str) -> str:
+    wanted = name.casefold()
+    for element in root.iter():
+        if _xml_local_name(element.tag) == wanted:
+            return (element.text or "").strip()
+    return ""
+
+
+def _safe_flex_error(root: ElementTree.Element, secrets: tuple[str, ...]) -> str:
+    code = _xml_text(root, "ErrorCode") or "unknown"
+    message = _xml_text(root, "ErrorMessage") or "request failed"
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    return f"IBKR Flex request failed ({code}): {message}"
+
+
+def _parse_flex_response(text: str) -> ElementTree.Element:
+    try:
+        return ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        raise IBKRFlexError("IBKR Flex returned invalid XML.") from None
+
+
+def fetch_ibkr_flex_xml(
+    token: str,
+    query_id: str,
+    *,
+    client: httpx.Client | None = None,
+    sleep=time.sleep,
+    max_attempts: int = 12,
+) -> str:
+    """Retrieve an Activity Flex report using the official two-step v3 flow.
+
+    Secrets are sent only as HTTPS query parameters to IBKR and are never
+    logged. Transient statement-generation responses are polled at a safe
+    interval; a final failure raises :class:`IBKRFlexError` with redaction.
+    """
+    token = str(token or "").strip()
+    query_id = str(query_id or "").strip()
+    if not token or not query_id:
+        raise IBKRFlexError(
+            "IBKR Flex requires IBKR_FLEX_TOKEN and IBKR_FLEX_QUERY_ID."
+        )
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    own_client = client is None
+    session = client or httpx.Client(
+        timeout=_HTTP_TIMEOUT,
+        follow_redirects=True,
+        headers={"User-Agent": _IBKR_FLEX_USER_AGENT},
+    )
+    secrets = (token, query_id)
+    try:
+        try:
+            response = session.get(
+                _IBKR_FLEX_SEND_URL,
+                params={"t": token, "q": query_id, "v": "3"},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            raise IBKRFlexError(
+                "IBKR Flex could not initiate the report request."
+            ) from None
+
+        root = _parse_flex_response(response.text)
+        if _xml_text(root, "Status").casefold() != "success":
+            raise IBKRFlexError(_safe_flex_error(root, secrets))
+        reference = _xml_text(root, "ReferenceCode")
+        report_url = _xml_text(root, "url")
+        if not reference or not report_url:
+            raise IBKRFlexError(
+                "IBKR Flex success response omitted its retrieval details."
+            )
+        parsed_url = urlparse(report_url)
+        if (
+            parsed_url.scheme.casefold() != "https"
+            or (parsed_url.hostname or "").casefold() != _IBKR_FLEX_HOST
+            or parsed_url.path != _IBKR_FLEX_REPORT_PATH
+        ):
+            raise IBKRFlexError(
+                "IBKR Flex returned an unexpected retrieval endpoint."
+            )
+
+        poll_secrets = (token, query_id, reference)
+        for attempt in range(max_attempts):
+            try:
+                report = session.get(
+                    report_url,
+                    params={"t": token, "q": reference, "v": "3"},
+                )
+                report.raise_for_status()
+            except httpx.HTTPError:
+                raise IBKRFlexError(
+                    "IBKR Flex could not retrieve the generated report."
+                ) from None
+
+            report_root = _parse_flex_response(report.text)
+            if _xml_local_name(report_root.tag) != "flexstatementresponse":
+                return report.text
+            status = _xml_text(report_root, "Status").casefold()
+            if status == "success":
+                # A successful retrieval should be the report itself, but do
+                # not mistake an acknowledgement for usable portfolio data.
+                raise IBKRFlexError(
+                    "IBKR Flex returned an empty report acknowledgement."
+                )
+            code = _xml_text(report_root, "ErrorCode")
+            if code not in _IBKR_FLEX_TRANSIENT_CODES:
+                raise IBKRFlexError(_safe_flex_error(report_root, poll_secrets))
+            if attempt + 1 < max_attempts:
+                sleep(5)
+
+        raise IBKRFlexError(
+            "IBKR Flex report was still being generated after the retry window."
+        )
+    finally:
+        if own_client:
+            session.close()
+
+
+def load_ibkr_flex_xml(xml_text: str) -> list[dict]:
+    """Parse open positions from a Flex XML report without retaining PII."""
+    root = _parse_flex_response(xml_text)
+    open_sections = [
+        element for element in root.iter()
+        if _xml_local_name(element.tag) == "openpositions"
+    ]
+    if not open_sections:
+        raise IBKRFlexError(
+            "IBKR Flex report does not contain an Open Positions section."
+        )
+
+    statement_dates = []
+    for element in root.iter():
+        if _xml_local_name(element.tag) != "flexstatement":
+            continue
+        for key, value in element.attrib.items():
+            if _normalise_key(key) in {"to date", "report date"}:
+                parsed = _date_value(value)
+                if parsed:
+                    statement_dates.append(parsed)
+    default_as_of = max(statement_dates) if statement_dates else ""
+
+    output: list[dict] = []
+    sensitive_keys = {"account", "account id", "account alias", "acct alias"}
+    for section in open_sections:
+        for element in section.iter():
+            if _xml_local_name(element.tag) != "openposition":
+                continue
+            safe_attributes = {
+                key: value for key, value in element.attrib.items()
+                if _normalise_key(key) not in sensitive_keys
+            }
+            parsed = _normalise_broker_row(
+                safe_attributes, "IBKR Flex Web Service"
+            )
+            if not parsed:
+                continue
+            parsed["account"] = ""
+            parsed["_flex_level"] = _normalise_key(
+                _row_value(
+                    safe_attributes,
+                    ("level of detail", "levelOfDetail", "detail level"),
+                ) or ""
+            )
+            if parsed.get("as_of"):
+                parsed["as_of_source"] = "Flex Open Positions report date"
+            else:
+                parsed["as_of"] = default_as_of
+                parsed["as_of_source"] = (
+                    "Flex statement date" if default_as_of else "unknown"
+                )
+            output.append(parsed)
+
+    # A query may request both Summary and Lot output. When IBKR labels both,
+    # prefer the summary row for that symbol so summary + component lots are
+    # not double-counted. If only lots exist, normal aggregation is correct.
+    summary_symbols = {
+        row["symbol"].casefold() for row in output
+        if row.get("_flex_level") in {"summary", "summarized"}
+    }
+    if summary_symbols:
+        output = [
+            row for row in output
+            if row["symbol"].casefold() not in summary_symbols
+            or row.get("_flex_level") in {"summary", "summarized"}
+        ]
+    for row in output:
+        row.pop("_flex_level", None)
+    return aggregate_positions(output)
 
 
 def _number(value) -> float | None:
@@ -290,11 +512,16 @@ def aggregate_positions(rows: list[dict]) -> list[dict]:
     return output
 
 
-def merge_positions(config_rows: list[dict], csv_rows: list[dict]) -> list[dict]:
+def merge_positions(
+    config_rows: list[dict],
+    broker_rows: list[dict],
+    *,
+    include_config_only: bool = True,
+) -> list[dict]:
     """Merge private broker numbers with config-only classification metadata."""
     configured = {row["symbol"].casefold(): row for row in config_rows}
     merged: list[dict] = []
-    for broker in csv_rows:
+    for broker in broker_rows:
         configured_row = configured.get(broker["symbol"].casefold())
         row = dict(configured_row or {})
         for key, value in broker.items():
@@ -311,10 +538,12 @@ def merge_positions(config_rows: list[dict], csv_rows: list[dict]) -> list[dict]
         row.setdefault("factors", [])
         row["watch_only"] = False
         merged.append(row)
-    broker_symbols = {row["symbol"].casefold() for row in csv_rows}
-    merged.extend(
-        row for row in config_rows if row["symbol"].casefold() not in broker_symbols
-    )
+    broker_symbols = {row["symbol"].casefold() for row in broker_rows}
+    if include_config_only:
+        merged.extend(
+            row for row in config_rows
+            if row["symbol"].casefold() not in broker_symbols
+        )
     return aggregate_positions(merged)
 
 
@@ -1188,6 +1417,18 @@ def format_view(report: dict) -> str:
 
 
 def configured_positions() -> list[dict]:
+    if config.PORTFOLIO_VIEW_IBKR_FLEX_ENABLED:
+        token = os.environ.get("IBKR_FLEX_TOKEN", "").strip()
+        query_id = os.environ.get("IBKR_FLEX_QUERY_ID", "").strip()
+        xml_text = fetch_ibkr_flex_xml(token, query_id)
+        broker_rows = load_ibkr_flex_xml(xml_text)
+        # In live mode config rows are metadata only. A stale config holding
+        # must never reappear after it has been closed at the broker.
+        return merge_positions(
+            config.PORTFOLIO_VIEW_POSITIONS,
+            broker_rows,
+            include_config_only=False,
+        )
     csv_rows = (
         load_ibkr_csv(config.PORTFOLIO_VIEW_IBKR_CSV)
         if config.PORTFOLIO_VIEW_IBKR_CSV else []

@@ -49,13 +49,16 @@ market_brief:
 
 # Separate comprehensive portfolio decision-support report.
 #
-# It does NOT log in to IBKR and cannot place orders. Export an Activity
-# Statement CSV locally, or supply position rows. Private portfolio values are
-# never written to the market-brief archive.
+# It does NOT log in to IBKR and cannot place orders. Use the optional read-only
+# Flex Web Service, export an Activity Statement CSV locally, or supply position
+# rows. Private portfolio values are never written to the market-brief archive.
 portfolio_view:
   enabled: false
   schedule_time: "08:15"
   base_currency: "USD"
+  ibkr_flex:
+    enabled: false              # when true, reads IBKR_FLEX_TOKEN and
+                                # IBKR_FLEX_QUERY_ID from the environment only
   ibkr_csv: ""                  # e.g. "data/ibkr-activity.csv"
   deployable_cash: 0            # cash you explicitly want allocated today
   max_position_pct: 20
@@ -63,9 +66,9 @@ portfolio_view:
   min_buy_score: 3
   max_snapshot_age_days: 3     # stale holdings force HOLD and block deployment
 
-  # Use these metadata rows to classify IBKR CSV holdings. If no CSV is used,
-  # quantity and average_cost make them standalone positions. Never commit your
-  # real private config.yaml.
+  # Use these metadata rows to classify IBKR Flex/CSV holdings. In Flex mode
+  # they are metadata only; otherwise quantity and average_cost can make them
+  # standalone positions. Never commit your real private config.yaml.
   positions: []
   # Example (keep commented until replaced with your own data):
   # - symbol: "QQQM"

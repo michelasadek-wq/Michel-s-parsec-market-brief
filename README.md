@@ -112,13 +112,40 @@ a missing model falls back to deterministic text.
 
 ## Configure the IBKR Daily View
 
-The view accepts either:
+The view accepts any one of:
 
+- a read-only IBKR Activity Flex Query retrieved with environment secrets;
 - a local IBKR Activity Statement CSV containing the `Open Positions` section;
 - a conventional positions CSV; or
 - explicit rows in the private `config.yaml`.
 
-### Option A — IBKR Activity Statement
+### Option A — read-only IBKR Flex Web Service
+
+Enable Flex input in the private config:
+
+```yaml
+portfolio_view:
+  enabled: true
+  base_currency: "USD"
+  ibkr_flex:
+    enabled: true
+```
+
+Provide the saved Activity Flex Query credentials only through environment
+variables or encrypted repository secrets:
+
+```bash
+export IBKR_FLEX_TOKEN="..."
+export IBKR_FLEX_QUERY_ID="..."
+python -m market_brief --view --no-compose
+```
+
+The client uses IBKR's official version 3 two-step flow, sets a User-Agent,
+polls while statement generation is in progress, and parses the report in
+memory. Tokens, Query IDs, reference codes, raw XML and account identifiers are
+not logged or archived. Flex mode is read-only and contains no order endpoint.
+
+### Option B — IBKR Activity Statement
 
 Export a CSV from IBKR and point the private config to it:
 
@@ -137,14 +164,14 @@ The parser recognises IBKR's sectioned `Open Positions,Header` and
 `Open Positions,Data` rows. It also understands common columns such as Symbol,
 Quantity, Cost Price, Close Price, Value and Unrealized P/L.
 
-### Option B — simple CSV
+### Option C — simple CSV
 
 ```csv
 Symbol,Description,Quantity,Average Price,Currency,Current Price,Unrealized P/L,Realized P/L
 QQQM,Invesco NASDAQ 100 ETF,10,210,USD,225,150,25
 ```
 
-### Option C — config rows
+### Option D — config rows
 
 ```yaml
 portfolio_view:
@@ -163,9 +190,10 @@ portfolio_view:
       realized_pnl: 25
 ```
 
-Config metadata is merged into matching CSV positions, which lets the broker
+Config metadata is merged into matching Flex/CSV positions, which lets the broker
 remain the source for quantity/cost/value while config provides sector, region
-and factor classifications.
+and factor classifications. In live Flex mode, config-only symbols are not
+treated as holdings, so a closed position cannot reappear from stale metadata.
 
 Both report sections honour their `enabled` switch. A configured CSV path that
 does not exist is a CLI error instead of a successful empty report.
@@ -211,7 +239,9 @@ not be compared on P/E alone.
 
 ## Privacy and guardrails
 
-- No IBKR username, password, token or session is accepted.
+- No IBKR username, password or trading session is accepted.
+- Optional Flex access accepts only a read-only report token and Query ID from
+  environment variables; neither value is logged or stored by the application.
 - No order-placement code exists.
 - Portfolio rows and P&L are not written to `data/briefs/`.
 - The market brief stays monitoring-only and cannot copy portfolio-view calls.
@@ -231,7 +261,7 @@ not be compared on P/E alone.
 ```text
 market_brief/
   brief.py             U.S./global monitoring pipeline and composer prompt
-  portfolio_view.py    IBKR CSV parsing, analytics, risk and action screen
+  portfolio_view.py    IBKR Flex/CSV parsing, analytics, risk and action screen
   smart_money.py       isolated SEC EDGAR 13F watcher
   config.py            safe YAML loading and both feature configurations
   senders.py           console sender and documented WhatsApp stub
@@ -242,7 +272,7 @@ docs/                  roadmap, source evaluation and partner notes
 ```
 
 Dependencies are `httpx`, `PyYAML`, `tzdata`, `pytest` and `pytest-asyncio`.
-There is no market-data SDK, database or broker integration.
+There is no market-data SDK, database or order-capable broker integration.
 
 ---
 

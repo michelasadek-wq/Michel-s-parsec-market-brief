@@ -360,8 +360,9 @@ COMPOSE_MODEL: str = str(
 
 # Separate from the terse monitoring brief. This feature calculates portfolio
 # performance, concentration, valuation/technical context, and evidence-based
-# BUY/HOLD/SELL labels. It reads a local IBKR CSV or explicit config rows and
-# never logs in to IBKR or places an order.
+# BUY/HOLD/SELL labels. It reads a local IBKR CSV, an explicitly enabled
+# read-only Flex report, or explicit config rows. It never logs in to IBKR or
+# places an order.
 _view_cfg = _cfg.get("portfolio_view", {})
 if not isinstance(_view_cfg, dict):
     logger.warning("portfolio_view section is not a mapping; ignoring it")
@@ -375,6 +376,15 @@ PORTFOLIO_VIEW_BASE_CURRENCY: str = str(
     _view_cfg.get("base_currency", "USD")
 ).strip().upper() or "USD"
 PORTFOLIO_VIEW_IBKR_CSV: Path | None = _optional_path(_view_cfg.get("ibkr_csv"))
+_view_flex_cfg = _view_cfg.get("ibkr_flex", {})
+if isinstance(_view_flex_cfg, bool):
+    _view_flex_cfg = {"enabled": _view_flex_cfg}
+elif not isinstance(_view_flex_cfg, dict):
+    logger.warning("portfolio_view.ibkr_flex is not a mapping; ignoring it")
+    _view_flex_cfg = {}
+PORTFOLIO_VIEW_IBKR_FLEX_ENABLED: bool = bool(
+    _view_flex_cfg.get("enabled", False)
+)
 PORTFOLIO_VIEW_POSITIONS: list[dict] = _portfolio_entries(
     _view_cfg.get("positions", []), "portfolio_view.positions"
 )
