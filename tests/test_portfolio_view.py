@@ -169,6 +169,51 @@ class TestIbkrFlex:
         assert rows[0]["quantity"] == 3
         assert rows[0]["average_cost"] == 110
 
+    def test_flex_keeps_only_latest_snapshot_from_multi_day_period(self):
+        report = """<FlexQueryResponse><FlexStatements><FlexStatement
+          fromDate="20260813" toDate="20260814"><OpenPositions>
+          <OpenPosition symbol="AAPL" position="1" markPrice="100"
+            positionValue="100" fifoPnlUnrealized="10"
+            reportDate="20260813" levelOfDetail="Summary" />
+          <OpenPosition symbol="AAPL" position="2" markPrice="110"
+            positionValue="220" fifoPnlUnrealized="30"
+            reportDate="20260814" levelOfDetail="Summary" />
+          <OpenPosition symbol="MSFT" position="1" markPrice="400"
+            positionValue="400" fifoPnlUnrealized="20"
+            reportDate="20260813" levelOfDetail="Summary" />
+          <OpenPosition symbol="NVDA" position="1" markPrice="180"
+            positionValue="180" fifoPnlUnrealized="15"
+            reportDate="20260814" levelOfDetail="Summary" />
+          </OpenPositions></FlexStatement></FlexStatements></FlexQueryResponse>"""
+
+        rows = portfolio_view.load_ibkr_flex_xml(report)
+
+        assert [row["symbol"] for row in rows] == ["AAPL", "NVDA"]
+        assert rows[0]["quantity"] == 2
+        assert rows[0]["market_value"] == 220
+        assert rows[0]["unrealized_pnl"] == 30
+        assert {row["as_of"] for row in rows} == {"2026-08-14"}
+
+    def test_flex_uses_statement_date_not_generic_open_date(self):
+        report = """<FlexQueryResponse><FlexStatements>
+          <FlexStatement toDate="20260813"><OpenPositions>
+            <OpenPosition symbol="AAPL" position="1" positionValue="100"
+              date="20260720" />
+          </OpenPositions></FlexStatement>
+          <FlexStatement toDate="20260814"><OpenPositions>
+            <OpenPosition symbol="AAPL" position="2" positionValue="220"
+              date="20260720" />
+          </OpenPositions></FlexStatement>
+        </FlexStatements></FlexQueryResponse>"""
+
+        rows = portfolio_view.load_ibkr_flex_xml(report)
+
+        assert len(rows) == 1
+        assert rows[0]["quantity"] == 2
+        assert rows[0]["market_value"] == 220
+        assert rows[0]["as_of"] == "2026-08-14"
+        assert rows[0]["as_of_source"] == "Flex statement date"
+
     def test_two_step_fetch_polls_transient_response(self):
         def response(text):
             item = MagicMock()
