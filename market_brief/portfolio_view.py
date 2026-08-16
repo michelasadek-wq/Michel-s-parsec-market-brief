@@ -227,29 +227,46 @@ def fetch_ibkr_flex_xml(
 def load_ibkr_flex_xml(xml_text: str) -> list[dict]:
     """Parse open positions from a Flex XML report without retaining PII."""
     root = _parse_flex_response(xml_text)
-    open_sections = [
+    statements = [
         element for element in root.iter()
-        if _xml_local_name(element.tag) == "openpositions"
+        if _xml_local_name(element.tag) == "flexstatement"
     ]
+
+    def statement_date(element: ElementTree.Element) -> str:
+        dates = []
+        for key, value in element.attrib.items():
+            if _normalise_key(key) in {"to date", "report date"}:
+                parsed = _date_value(value)
+                if parsed:
+                    dates.append(parsed)
+        return max(dates) if dates else ""
+
+    statement_dates = [value for value in map(statement_date, statements) if value]
+    default_as_of = max(statement_dates) if statement_dates else ""
+
+    # A multi-day Flex query can return one Open Positions snapshot per
+    # statement day. Retain the containing statement date so those snapshots
+    # can be separated before symbol aggregation.
+    open_sections: list[tuple[ElementTree.Element, str]] = []
+    for statement in statements:
+        as_of = statement_date(statement) or default_as_of
+        open_sections.extend(
+            (element, as_of) for element in statement.iter()
+            if _xml_local_name(element.tag) == "openpositions"
+        )
+    if not statements:
+        open_sections = [
+            (element, default_as_of) for element in root.iter()
+            if _xml_local_name(element.tag) == "openpositions"
+        ]
     if not open_sections:
         raise IBKRFlexError(
             "IBKR Flex report does not contain an Open Positions section."
         )
 
-    statement_dates = []
-    for element in root.iter():
-        if _xml_local_name(element.tag) != "flexstatement":
-            continue
-        for key, value in element.attrib.items():
-            if _normalise_key(key) in {"to date", "report date"}:
-                parsed = _date_value(value)
-                if parsed:
-                    statement_dates.append(parsed)
-    default_as_of = max(statement_dates) if statement_dates else ""
-
     output: list[dict] = []
     sensitive_keys = {"account", "account id", "account alias", "acct alias"}
-    for section in open_sections:
+    for section, statement_as_of in open_sections:
         for element in section.iter():
             if _xml_local_name(element.tag) != "openposition":
                 continue
@@ -269,14 +286,30 @@ def load_ibkr_flex_xml(xml_text: str) -> list[dict]:
                     ("level of detail", "levelOfDetail", "detail level"),
                 ) or ""
             )
-            if parsed.get("as_of"):
+            # In Flex Open Positions, Report Date is the snapshot date. Do not
+            # let a generic Date/Open Date field make a purchase date look like
+            # the portfolio's freshness date.
+            report_as_of = _date_value(_row_value(
+                safe_attributes, ("report date", "reportDate")
+            ))
+            if report_as_of:
+                parsed["as_of"] = report_as_of
                 parsed["as_of_source"] = "Flex Open Positions report date"
             else:
-                parsed["as_of"] = default_as_of
+                parsed["as_of"] = statement_as_of or default_as_of
                 parsed["as_of_source"] = (
-                    "Flex statement date" if default_as_of else "unknown"
+                    "Flex statement date" if parsed["as_of"] else "unknown"
                 )
             output.append(parsed)
+
+    # Periods such as Month to Date can include a complete position snapshot
+    # for every business day. Aggregating those rows multiplies quantities,
+    # values and P&L. Keep only the newest complete statement snapshot before
+    # handling Summary/Lot detail and aggregating symbols.
+    snapshot_dates = sorted({row.get("as_of") for row in output if row.get("as_of")})
+    if snapshot_dates:
+        latest_snapshot = snapshot_dates[-1]
+        output = [row for row in output if row.get("as_of") == latest_snapshot]
 
     # A query may request both Summary and Lot output. When IBKR labels both,
     # prefer the summary row for that symbol so summary + component lots are
