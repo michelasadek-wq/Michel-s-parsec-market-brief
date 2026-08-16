@@ -386,6 +386,66 @@ def load_ibkr_flex_xml(xml_text: str) -> list[dict]:
     return aggregate_positions(output)
 
 
+def load_ibkr_flex_nav(xml_text: str) -> dict | None:
+    """Return the latest base-currency NAV summary without retaining PII."""
+    root = _parse_flex_response(xml_text)
+    rows = []
+    value_fields = {
+        "cash": ("cash",),
+        "stock": ("stock",),
+        "options": ("options",),
+        "commodities": ("commodities",),
+        "bonds": ("bonds",),
+        "notes": ("notes",),
+        "funds": ("funds",),
+        "interest_accruals": ("interest accruals", "interestAccruals"),
+        "dividend_accruals": ("dividend accruals", "dividendAccruals"),
+        "total": ("total",),
+    }
+    for element in root.iter():
+        if _xml_local_name(element.tag) != "equitysummarybyreportdateinbase":
+            continue
+        as_of = _date_value(_row_value(
+            element.attrib, ("report date", "reportDate")
+        ))
+        if not as_of:
+            continue
+        row = {
+            "as_of": as_of,
+            "currency": str(_row_value(element.attrib, ("currency",)) or "")
+            .strip().upper(),
+        }
+        for field, aliases in value_fields.items():
+            row[field] = _number(_row_value(element.attrib, aliases))
+        rows.append(row)
+    if not rows:
+        return None
+
+    latest = max(row["as_of"] for row in rows)
+    current = [row for row in rows if row["as_of"] == latest]
+
+    def summed(field: str) -> float | None:
+        values = [row.get(field) for row in current]
+        if not values or not all(isinstance(value, (int, float)) for value in values):
+            return None
+        return sum(values)
+
+    out = {field: summed(field) for field in value_fields}
+    out["as_of"] = latest
+    currencies = {row["currency"] for row in current if row.get("currency")}
+    out["currency"] = currencies.pop() if len(currencies) == 1 else ""
+    position_fields = (
+        "stock", "options", "commodities", "bonds", "notes", "funds",
+    )
+    position_values = [out.get(field) for field in position_fields]
+    out["positions_value"] = (
+        sum(value for value in position_values if isinstance(value, (int, float)))
+        if any(isinstance(value, (int, float)) for value in position_values)
+        else None
+    )
+    return out
+
+
 def _number(value) -> float | None:
     """Parse broker-style numbers: commas, percent signs, and parentheses."""
     if value is None or value == "":
@@ -1172,7 +1232,8 @@ def build_report(positions: list[dict], candidates: list[dict] | None = None,
                  min_buy_score: int = 3, max_snapshot_age_days: int = 3,
                  quote_fetcher=brief.fetch_quote,
                  fundamentals_fetcher=fetch_fundamentals,
-                 fx_fetcher=fetch_fx_rate, headline_fetcher=None) -> dict:
+                 fx_fetcher=fetch_fx_rate, headline_fetcher=None,
+                 broker_nav: dict | None = None) -> dict:
     """Build a complete view. Injected fetchers keep every test offline."""
     candidates = candidates or []
     source_rows = [dict(row, watch_only=False) for row in positions]
@@ -1199,6 +1260,64 @@ def build_report(positions: list[dict], candidates: list[dict] | None = None,
         analysed.append(analysed_row)
 
     summary = portfolio_summary(analysed, deployable_cash, base_currency)
+    summary.update({
+        "broker_nav": None,
+        "broker_cash": None,
+        "broker_positions_value": None,
+        "nav_verified": False,
+    })
+    if broker_nav is not None:
+        nav_total = broker_nav.get("total")
+        nav_positions = broker_nav.get("positions_value")
+        nav_cash = broker_nav.get("cash")
+        nav_currency = str(broker_nav.get("currency") or base_currency).upper()
+        position_dates = {
+            row.get("as_of") for row in analysed
+            if row.get("is_holding") and row.get("as_of")
+        }
+        if nav_currency != base_currency.upper():
+            raise IBKRFlexError(
+                "IBKR Flex validation failed: NAV currency does not match "
+                "the configured base currency."
+            )
+        if position_dates != {broker_nav.get("as_of")}:
+            raise IBKRFlexError(
+                "IBKR Flex validation failed: position and NAV report dates "
+                "do not match."
+            )
+        if not summary["securities_value_complete"] or not isinstance(
+            nav_positions, (int, float)
+        ) or not isinstance(nav_total, (int, float)):
+            raise IBKRFlexError(
+                "IBKR Flex validation failed: NAV or position totals are incomplete."
+            )
+        tolerance = max(0.05, abs(nav_positions) * 0.005)
+        if not math.isclose(
+            summary["securities_value"], nav_positions,
+            rel_tol=0.0, abs_tol=tolerance,
+        ):
+            raise IBKRFlexError(
+                "IBKR Flex validation failed: holdings do not reconcile to "
+                "the NAV position total."
+            )
+        summary.update({
+            "broker_nav": nav_total,
+            "broker_cash": nav_cash,
+            "broker_positions_value": nav_positions,
+            "nav_verified": True,
+            "account_value": nav_total,
+            "known_account_value": nav_total,
+            "account_value_complete": True,
+        })
+        for row in analysed:
+            if not row.get("is_holding"):
+                continue
+            value = row.get("market_value_base")
+            row["allocation_pct"] = (
+                value / nav_total * 100
+                if isinstance(value, (int, float)) and nav_total != 0
+                else None
+            )
     sectors = exposure(analysed, "sector")
     regions = exposure(analysed, "region")
     factors = exposure(analysed, "factors")
@@ -1360,24 +1479,41 @@ def format_view(report: dict) -> str:
     currency = summary["base_currency"]
     lines = [f"*IBKR DAILY VIEW — {report['as_of']}*", ""]
     lines.append("*1. Portfolio snapshot*")
-    if summary["account_value_complete"]:
+    if summary.get("nav_verified"):
         lines.append(
-            f"- Account value: {summary['account_value']:,.2f} {currency} "
-            f"({summary['securities_value']:,.2f} invested + "
-            f"{summary['deployable_cash']:,.2f} deployable cash)"
+            f"- Verified IBKR NAV: {summary['broker_nav']:,.2f} {currency}"
+        )
+        lines.append(
+            f"- Positions value: {summary['securities_value']:,.2f} {currency}; "
+            f"broker cash: {_metric(summary.get('broker_cash'))} {currency}"
+        )
+        lines.append(
+            "- Validation: PASSED — latest holdings reconcile to the separate "
+            "IBKR NAV Summary for the same report date"
         )
     else:
         lines.append(
-            f"- Account value: unavailable — known subtotal "
-            f"{summary['known_account_value']:,.2f} {currency}; at least one "
-            "position lacks a base-currency value"
+            "- Verified IBKR NAV: unavailable — this report is not "
+            "independently validated"
         )
+        lines.append(
+            f"- Positions value: {_metric(summary.get('securities_value'))} "
+            f"{currency}"
+        )
+        lines.append(
+            "- Validation: UNVERIFIED — do not treat figures as actual account totals"
+        )
+    lines.append(
+        f"- User-marked deployable cash: "
+        f"{summary['deployable_cash']:,.2f} {currency}"
+    )
     snapshot = report.get("snapshot_as_of") or "unknown"
     snapshot_note = " (mixed dates; oldest shown)" if report.get("snapshot_dates_mixed") else ""
     snapshot_sources = ", ".join(report.get("snapshot_sources") or []) or "manual/config input"
     lines += [
         f"- Position snapshot: {snapshot}{snapshot_note}; source: {snapshot_sources}",
-        f"- Daily P&L: {_money(summary['daily_pnl'], currency, summary['daily_pnl_complete'])}",
+        f"- Estimated daily P&L from market quotes: "
+        f"{_money(summary['daily_pnl'], currency, summary['daily_pnl_complete'])}",
         f"- Unrealized P&L: {_money(summary['unrealized_pnl'], currency, summary['unrealized_pnl_complete'])}",
         f"- Realized P&L: {_money(summary['realized_pnl'], currency, summary['realized_pnl_complete'])}",
         f"- Combined supplied P&L: "
@@ -1502,29 +1638,43 @@ def format_view(report: dict) -> str:
     return "\n".join(lines)
 
 
-def configured_positions() -> list[dict]:
+def _configured_positions_and_nav() -> tuple[list[dict], dict | None]:
     if config.PORTFOLIO_VIEW_IBKR_FLEX_ENABLED:
         token = os.environ.get("IBKR_FLEX_TOKEN", "").strip()
         query_id = os.environ.get("IBKR_FLEX_QUERY_ID", "").strip()
         xml_text = fetch_ibkr_flex_xml(token, query_id)
         broker_rows = load_ibkr_flex_xml(xml_text)
+        broker_nav = load_ibkr_flex_nav(xml_text)
+        if broker_nav is None:
+            raise IBKRFlexError(
+                "IBKR Flex validation failed: the NAV Summary section is required."
+            )
         # In live mode config rows are metadata only. A stale config holding
         # must never reappear after it has been closed at the broker.
-        return merge_positions(
-            config.PORTFOLIO_VIEW_POSITIONS,
-            broker_rows,
-            include_config_only=False,
+        return (
+            merge_positions(
+                config.PORTFOLIO_VIEW_POSITIONS,
+                broker_rows,
+                include_config_only=False,
+            ),
+            broker_nav,
         )
     csv_rows = (
         load_ibkr_csv(config.PORTFOLIO_VIEW_IBKR_CSV)
         if config.PORTFOLIO_VIEW_IBKR_CSV else []
     )
-    return merge_positions(config.PORTFOLIO_VIEW_POSITIONS, csv_rows)
+    return merge_positions(config.PORTFOLIO_VIEW_POSITIONS, csv_rows), None
+
+
+def configured_positions() -> list[dict]:
+    rows, _ = _configured_positions_and_nav()
+    return rows
 
 
 def build_configured_report() -> dict:
+    positions, broker_nav = _configured_positions_and_nav()
     return build_report(
-        configured_positions(),
+        positions,
         config.PORTFOLIO_VIEW_CANDIDATES,
         base_currency=config.PORTFOLIO_VIEW_BASE_CURRENCY,
         deployable_cash=config.PORTFOLIO_VIEW_DEPLOYABLE_CASH,
@@ -1533,6 +1683,7 @@ def build_configured_report() -> dict:
         min_buy_score=config.PORTFOLIO_VIEW_MIN_BUY_SCORE,
         max_snapshot_age_days=config.PORTFOLIO_VIEW_MAX_SNAPSHOT_AGE_DAYS,
         headline_fetcher=brief.fetch_headlines,
+        broker_nav=broker_nav,
     )
 
 
