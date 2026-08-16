@@ -125,6 +125,11 @@ class TestIbkrFlex:
 <FlexQueryResponse queryName="Daily Portfolio Monitoring">
   <FlexStatements count="1">
     <FlexStatement accountId="PRIVATE" fromDate="20260801" toDate="20260814">
+      <EquitySummaryInBase>
+        <EquitySummaryByReportDateInBase accountId="PRIVATE" currency="USD"
+          reportDate="20260814" cash="5" stock="840" options="0"
+          commodities="0" bonds="0" notes="0" funds="0" total="845" />
+      </EquitySummaryInBase>
       <OpenPositions>
         <OpenPosition accountId="PRIVATE" acctAlias="PRIVATE_ALIAS"
           assetCategory="STK" currency="USD" symbol="MSFT"
@@ -154,6 +159,34 @@ class TestIbkrFlex:
             portfolio_view.load_ibkr_flex_xml(
                 "<FlexQueryResponse><FlexStatements /></FlexQueryResponse>"
             )
+
+    def test_flex_nav_uses_latest_report_date(self):
+        report = """<FlexQueryResponse><FlexStatements><FlexStatement>
+          <EquitySummaryInBase>
+            <EquitySummaryByReportDateInBase currency="USD"
+              reportDate="20260813" cash="4" stock="800" total="804" />
+            <EquitySummaryByReportDateInBase currency="USD"
+              reportDate="20260814" cash="5" stock="840" total="845" />
+          </EquitySummaryInBase>
+        </FlexStatement></FlexStatements></FlexQueryResponse>"""
+
+        nav = portfolio_view.load_ibkr_flex_nav(report)
+
+        assert nav == {
+            "cash": 5,
+            "stock": 840,
+            "options": None,
+            "commodities": None,
+            "bonds": None,
+            "notes": None,
+            "funds": None,
+            "interest_accruals": None,
+            "dividend_accruals": None,
+            "total": 845,
+            "as_of": "2026-08-14",
+            "currency": "USD",
+            "positions_value": 840,
+        }
 
     def test_summary_row_prevents_double_counting_lots(self):
         report = """<FlexQueryResponse><FlexStatements><FlexStatement
@@ -347,6 +380,38 @@ class TestIbkrFlex:
 
 
 class TestCalculations:
+    def test_broker_nav_independently_validates_positions(self):
+        report = portfolio_view.build_report(
+            [_row(as_of="2026-08-14")],
+            quote_fetcher=lambda _: _quote(),
+            fundamentals_fetcher=lambda _: _facts(),
+            fx_fetcher=_fx,
+            broker_nav={
+                "as_of": "2026-08-14", "currency": "USD",
+                "positions_value": 1500, "cash": 25, "total": 1525,
+            },
+        )
+
+        assert report["summary"]["nav_verified"] is True
+        assert report["summary"]["broker_nav"] == 1525
+        assert report["summary"]["broker_cash"] == 25
+        assert report["holdings"][0]["allocation_pct"] == pytest.approx(
+            1500 / 1525 * 100
+        )
+
+    def test_broker_nav_mismatch_fails_closed(self):
+        with pytest.raises(portfolio_view.IBKRFlexError, match="reconcile"):
+            portfolio_view.build_report(
+                [_row(as_of="2026-08-14")],
+                quote_fetcher=lambda _: _quote(),
+                fundamentals_fetcher=lambda _: _facts(),
+                fx_fetcher=_fx,
+                broker_nav={
+                    "as_of": "2026-08-14", "currency": "USD",
+                    "positions_value": 150, "cash": 25, "total": 175,
+                },
+            )
+
     def test_complete_profit_and_allocation(self):
         report = portfolio_view.build_report(
             [_row()],
@@ -410,7 +475,7 @@ class TestCalculations:
         assert report["summary"]["account_value"] is None
         assert report["summary"]["account_value_complete"] is False
         assert report["holdings"][0]["decision"]["action"] == "HOLD"
-        assert "Account value: unavailable" in portfolio_view.format_view(report)
+        assert "Verified IBKR NAV: unavailable" in portfolio_view.format_view(report)
         assert any("FX conversion" in warning for warning in report["warnings"])
 
     def test_stale_snapshot_blocks_recommendations(self, monkeypatch):
@@ -542,7 +607,8 @@ class TestRenderingAndDelivery:
         )
         text = portfolio_view.format_view(report)
         for expected in (
-            "Portfolio snapshot", "Combined supplied P&L", "P/E T/F", "PEG",
+            "Portfolio snapshot", "Verified IBKR NAV", "Combined supplied P&L",
+            "P/E T/F", "PEG",
             "Exposure and diversification", "Risks and data gaps",
             "Market context and catalysts", "Actions and cash deployment",
             "BUY", "HOLD", "SELL", "Research candidates", "no IBKR login",
