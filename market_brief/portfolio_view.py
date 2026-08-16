@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import logging
+import math
 import os
 import re
 import time
@@ -286,6 +287,10 @@ def load_ibkr_flex_xml(xml_text: str) -> list[dict]:
                     ("level of detail", "levelOfDetail", "detail level"),
                 ) or ""
             )
+            parsed["_flex_open_date"] = str(_row_value(
+                safe_attributes,
+                ("open date time", "openDateTime", "lot open date time"),
+            ) or "").strip()
             # In Flex Open Positions, Report Date is the snapshot date. Do not
             # let a generic Date/Open Date field make a purchase date look like
             # the portfolio's freshness date.
@@ -311,6 +316,57 @@ def load_ibkr_flex_xml(xml_text: str) -> list[dict]:
         latest_snapshot = snapshot_dates[-1]
         output = [row for row in output if row.get("as_of") == latest_snapshot]
 
+    # Some Flex configurations request Summary and Lot output but omit the
+    # Level of Detail column. In that case the summary row has no open date and
+    # its quantity/value/P&L equal the sum of the dated component lots. Detect
+    # that relationship instead of counting the economic position twice.
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in output:
+        grouped[row["symbol"].casefold()].append(row)
+    deduplicated = []
+    for parts in grouped.values():
+        if any(part.get("_flex_level") for part in parts):
+            deduplicated.extend(parts)
+            continue
+        candidates = []
+        for candidate in parts:
+            components = [part for part in parts if part is not candidate]
+            if not components:
+                continue
+            comparisons = 0
+            matches = True
+            for field in ("quantity", "market_value", "unrealized_pnl"):
+                expected = candidate.get(field)
+                values = [part.get(field) for part in components]
+                if not isinstance(expected, (int, float)) or not all(
+                    isinstance(value, (int, float)) for value in values
+                ):
+                    continue
+                comparisons += 1
+                if not math.isclose(
+                    expected,
+                    sum(values),
+                    rel_tol=1e-7,
+                    abs_tol=0.02,
+                ):
+                    matches = False
+                    break
+            if comparisons >= 2 and matches:
+                candidates.append(candidate)
+
+        undated_summaries = [
+            row for row in candidates if not row.get("_flex_open_date")
+        ]
+        if len(undated_summaries) == 1:
+            deduplicated.append(undated_summaries[0])
+        elif len(parts) == 2 and candidates:
+            # A one-lot position can make the unlabeled summary and lot
+            # numerically identical. Keeping either row is the correct total.
+            deduplicated.append(candidates[0])
+        else:
+            deduplicated.extend(parts)
+    output = deduplicated
+
     # A query may request both Summary and Lot output. When IBKR labels both,
     # prefer the summary row for that symbol so summary + component lots are
     # not double-counted. If only lots exist, normal aggregation is correct.
@@ -326,6 +382,7 @@ def load_ibkr_flex_xml(xml_text: str) -> list[dict]:
         ]
     for row in output:
         row.pop("_flex_level", None)
+        row.pop("_flex_open_date", None)
     return aggregate_positions(output)
 
 
