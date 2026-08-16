@@ -169,6 +169,44 @@ class TestIbkrFlex:
         assert rows[0]["quantity"] == 3
         assert rows[0]["average_cost"] == 110
 
+    def test_unlabelled_summary_prevents_double_counting_lots(self):
+        report = """<FlexQueryResponse><FlexStatements><FlexStatement
+          toDate="20260814"><OpenPositions>
+          <OpenPosition symbol="AAPL" position="3" markPrice="150"
+            positionValue="450" fifoPnlUnrealized="120"
+            costBasisPrice="110" openDateTime="" />
+          <OpenPosition symbol="AAPL" position="2" markPrice="150"
+            positionValue="300" fifoPnlUnrealized="100"
+            costBasisPrice="100" openDateTime="20260720;10:00:00" />
+          <OpenPosition symbol="AAPL" position="1" markPrice="150"
+            positionValue="150" fifoPnlUnrealized="20"
+            costBasisPrice="130" openDateTime="20260801;10:00:00" />
+          </OpenPositions></FlexStatement></FlexStatements></FlexQueryResponse>"""
+
+        rows = portfolio_view.load_ibkr_flex_xml(report)
+
+        assert len(rows) == 1
+        assert rows[0]["quantity"] == 3
+        assert rows[0]["market_value"] == 450
+        assert rows[0]["unrealized_pnl"] == 120
+        assert rows[0]["average_cost"] == 110
+
+    def test_unlabelled_summary_and_single_lot_are_not_doubled(self):
+        report = """<FlexQueryResponse><FlexStatements><FlexStatement
+          toDate="20260814"><OpenPositions>
+          <OpenPosition symbol="AAPL" position="1" positionValue="150"
+            fifoPnlUnrealized="20" />
+          <OpenPosition symbol="AAPL" position="1" positionValue="150"
+            fifoPnlUnrealized="20" />
+          </OpenPositions></FlexStatement></FlexStatements></FlexQueryResponse>"""
+
+        rows = portfolio_view.load_ibkr_flex_xml(report)
+
+        assert len(rows) == 1
+        assert rows[0]["quantity"] == 1
+        assert rows[0]["market_value"] == 150
+        assert rows[0]["unrealized_pnl"] == 20
+
     def test_flex_keeps_only_latest_snapshot_from_multi_day_period(self):
         report = """<FlexQueryResponse><FlexStatements><FlexStatement
           fromDate="20260813" toDate="20260814"><OpenPositions>
