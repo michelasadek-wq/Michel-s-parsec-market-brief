@@ -32,12 +32,28 @@ from . import brief, config
 
 logger = logging.getLogger(__name__)
 
-_YAHOO_QUOTE_URL = (
-    "https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+_YAHOO_FUNDAMENTALS_URL = (
+    "https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/"
+    "timeseries/{symbol}"
+)
+_YAHOO_HISTORY_URL = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 )
 _YAHOO_FX_URL = (
     "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     "?range=5d&interval=1d"
+)
+_YAHOO_FUNDAMENTAL_TYPES = (
+    "trailingPeRatio",
+    "trailingForwardPeRatio",
+    "trailingPegRatio",
+    "quarterlyDilutedEPS",
+    "quarterlyTotalRevenue",
+    "trailingTotalRevenue",
+    "trailingNetIncome",
+    "quarterlyTotalDebt",
+    "quarterlyStockholdersEquity",
+    "trailingMarketCap",
 )
 _HTTP_TIMEOUT = 15
 _IBKR_FLEX_SEND_URL = (
@@ -102,6 +118,10 @@ def _normalise_key(value: str) -> str:
 
 class IBKRFlexError(RuntimeError):
     """A safe Flex failure whose message never contains request secrets."""
+
+
+class PortfolioDataQualityError(RuntimeError):
+    """Raised when a report would be materially incomplete or misleading."""
 
 
 def _xml_local_name(tag: str) -> str:
@@ -699,50 +719,186 @@ def _raw(value):
     return value
 
 
+def _timeseries_values(payload: dict, field: str) -> list[tuple[float, str]]:
+    """Return valid ``(raw value, as-of date)`` pairs for one Yahoo series."""
+    blocks = ((payload.get("timeseries") or {}).get("result") or [])
+    for block in blocks:
+        if field not in block:
+            continue
+        values = []
+        for item in block.get(field) or []:
+            value = _number(_raw(item.get("reportedValue")))
+            if value is not None:
+                values.append((value, str(item.get("asOfDate") or "")))
+        return values
+    return []
+
+
+def _latest_timeseries(payload: dict, field: str) -> tuple[float | None, str]:
+    values = _timeseries_values(payload, field)
+    return values[-1] if values else (None, "")
+
+
+def _latest_timeseries_currency(payload: dict, field: str) -> str:
+    blocks = ((payload.get("timeseries") or {}).get("result") or [])
+    for block in blocks:
+        values = block.get(field) or []
+        if values:
+            return str(values[-1].get("currencyCode") or "").upper()
+    return ""
+
+
+def _quarterly_growth(payload: dict, field: str) -> float | None:
+    """Latest quarter versus the comparable quarter one year earlier."""
+    values = _timeseries_values(payload, field)
+    if len(values) < 5:
+        return None
+    latest, prior = values[-1][0], values[-5][0]
+    # Percentage growth from zero or a loss is not economically meaningful.
+    if prior <= 0:
+        return None
+    return (latest / prior - 1) * 100
+
+
 def fetch_fundamentals(symbol: str) -> dict:
-    """Fetch a compact valuation/technical pack; failure returns unavailable."""
+    """Fetch valuation, growth, quality and technical data without an API key.
+
+    Yahoo's old v7 quote endpoint now rejects unauthenticated server requests.
+    The chart and fundamentals-timeseries endpoints remain accessible and are
+    fetched independently so one degraded source does not erase the other.
+    """
     out = {field: None for field in _NUMBER_FIELDS - {
         "quantity", "average_cost", "current_price", "market_value",
         "unrealized_pnl", "realized_pnl",
     }}
     out.update({
         "ok": False,
-        "source": "Yahoo Finance quote",
+        "source": "Yahoo Finance chart + fundamentals timeseries",
         "as_of": datetime.now(timezone.utc).date().isoformat(),
     })
+
+    as_of_dates = []
+    chart_ok = False
     try:
         response = httpx.get(
-            _YAHOO_QUOTE_URL.format(symbol=symbol),
+            _YAHOO_HISTORY_URL.format(symbol=symbol),
+            params={"range": "1y", "interval": "1d", "events": "div"},
             timeout=_HTTP_TIMEOUT,
             follow_redirects=True,
             headers=brief._HTTP_HEADERS,
         )
         response.raise_for_status()
-        results = ((response.json().get("quoteResponse") or {}).get("result") or [])
-        if not results:
-            return out
-        data = results[0]
+        result = (((response.json().get("chart") or {}).get("result") or [None])[0])
+        if result:
+            meta = result.get("meta") or {}
+            quote = (((result.get("indicators") or {}).get("quote") or [{}])[0])
+            closes = [
+                value for value in (quote.get("close") or [])
+                if isinstance(value, (int, float))
+            ]
+            if len(closes) >= 40:
+                out["fifty_day_average"] = sum(closes[-50:]) / len(closes[-50:])
+            if len(closes) >= 160:
+                out["two_hundred_day_average"] = sum(closes[-200:]) / len(closes[-200:])
+            out["fifty_two_week_high"] = _number(meta.get("fiftyTwoWeekHigh"))
+            out["fifty_two_week_low"] = _number(meta.get("fiftyTwoWeekLow"))
+            price = _number(meta.get("regularMarketPrice")) or (closes[-1] if closes else None)
+            dividends = ((result.get("events") or {}).get("dividends") or {}).values()
+            annual_dividend = sum(
+                _number(item.get("amount")) or 0 for item in dividends
+            )
+            if price and annual_dividend:
+                out["dividend_yield_pct"] = annual_dividend / price * 100
+            timestamp = _number(meta.get("regularMarketTime"))
+            if timestamp:
+                as_of_dates.append(
+                    datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+                )
+            chart_ok = any(
+                out.get(field) is not None for field in (
+                    "fifty_day_average", "two_hundred_day_average",
+                    "fifty_two_week_high", "fifty_two_week_low",
+                    "dividend_yield_pct",
+                )
+            )
+    except Exception as exc:
+        logger.warning("Technical data unavailable for %s: %s", symbol, exc)
+
+    fundamentals_ok = False
+    try:
+        period2 = int(time.time()) + 86400
+        period1 = period2 - 3 * 366 * 86400
+        response = httpx.get(
+            _YAHOO_FUNDAMENTALS_URL.format(symbol=symbol),
+            params={
+                "symbol": symbol,
+                "type": ",".join(_YAHOO_FUNDAMENTAL_TYPES),
+                "period1": period1,
+                "period2": period2,
+            },
+            timeout=_HTTP_TIMEOUT,
+            follow_redirects=True,
+            headers=brief._HTTP_HEADERS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
         mapping = {
-            "trailing_pe": "trailingPE",
-            "forward_pe": "forwardPE",
-            "peg": "pegRatio",
-            "price_to_book": "priceToBook",
-            "dividend_yield_pct": "trailingAnnualDividendYield",
-            "beta": "beta",
-            "fifty_day_average": "fiftyDayAverage",
-            "two_hundred_day_average": "twoHundredDayAverage",
-            "fifty_two_week_high": "fiftyTwoWeekHigh",
-            "fifty_two_week_low": "fiftyTwoWeekLow",
-            "market_cap": "marketCap",
+            "trailing_pe": "trailingPeRatio",
+            "forward_pe": "trailingForwardPeRatio",
+            "peg": "trailingPegRatio",
+            "market_cap": "trailingMarketCap",
         }
-        for field, yahoo_field in mapping.items():
-            out[field] = _number(_raw(data.get(yahoo_field)))
-        if out["dividend_yield_pct"] is not None:
-            out["dividend_yield_pct"] *= 100
-        trailing_eps = _number(_raw(data.get("epsTrailingTwelveMonths")))
-        forward_eps = _number(_raw(data.get("epsForward")))
-        if trailing_eps and forward_eps and trailing_eps > 0:
-            out["earnings_growth_pct"] = (forward_eps / trailing_eps - 1) * 100
+        for field, series in mapping.items():
+            value, value_as_of = _latest_timeseries(payload, series)
+            out[field] = value
+            if value_as_of:
+                as_of_dates.append(value_as_of)
+
+        out["earnings_growth_pct"] = _quarterly_growth(
+            payload, "quarterlyDilutedEPS"
+        )
+        out["revenue_growth_pct"] = _quarterly_growth(
+            payload, "quarterlyTotalRevenue"
+        )
+
+        revenue, revenue_as_of = _latest_timeseries(payload, "trailingTotalRevenue")
+        net_income, income_as_of = _latest_timeseries(payload, "trailingNetIncome")
+        debt, debt_as_of = _latest_timeseries(payload, "quarterlyTotalDebt")
+        equity, equity_as_of = _latest_timeseries(
+            payload, "quarterlyStockholdersEquity"
+        )
+        for value_as_of in (revenue_as_of, income_as_of, debt_as_of, equity_as_of):
+            if value_as_of:
+                as_of_dates.append(value_as_of)
+        revenue_currency = _latest_timeseries_currency(
+            payload, "trailingTotalRevenue"
+        )
+        income_currency = _latest_timeseries_currency(payload, "trailingNetIncome")
+        debt_currency = _latest_timeseries_currency(payload, "quarterlyTotalDebt")
+        equity_currency = _latest_timeseries_currency(
+            payload, "quarterlyStockholdersEquity"
+        )
+        market_cap_currency = _latest_timeseries_currency(
+            payload, "trailingMarketCap"
+        )
+        if (
+            revenue
+            and net_income is not None
+            and revenue_currency
+            and revenue_currency == income_currency
+        ):
+            out["profit_margin_pct"] = net_income / revenue * 100
+        if equity and debt is not None and debt_currency and debt_currency == equity_currency:
+            # Match Yahoo's conventional debt-to-equity presentation (percent).
+            out["debt_to_equity"] = debt / equity * 100
+        if (
+            equity
+            and out.get("market_cap") is not None
+            and market_cap_currency
+            and market_cap_currency == equity_currency
+        ):
+            out["price_to_book"] = out["market_cap"] / equity
         if (
             out["peg"] is None
             and out["forward_pe"] is not None
@@ -750,12 +906,21 @@ def fetch_fundamentals(symbol: str) -> dict:
             and out["earnings_growth_pct"] > 0
         ):
             out["peg"] = out["forward_pe"] / out["earnings_growth_pct"]
-        timestamp = _number(data.get("regularMarketTime"))
-        if timestamp:
-            out["as_of"] = datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
-        out["ok"] = True
+        fundamentals_ok = any(
+            out.get(field) is not None for field in (
+                "trailing_pe", "forward_pe", "peg", "earnings_growth_pct",
+                "revenue_growth_pct", "profit_margin_pct", "debt_to_equity",
+                "price_to_book", "market_cap",
+            )
+        )
     except Exception as exc:
-        logger.warning("Fundamentals unavailable for %s: %s", symbol, exc)
+        logger.warning("Fundamentals timeseries unavailable for %s: %s", symbol, exc)
+
+    if as_of_dates:
+        out["as_of"] = max(as_of_dates)
+    out["ok"] = chart_ok or fundamentals_ok
+    if not out["ok"]:
+        logger.warning("Analytical market data unavailable for %s", symbol)
     return out
 
 
@@ -1226,6 +1391,78 @@ def _portfolio_watchlist(rows: list[dict]) -> list[dict]:
     ]
 
 
+_FUNDAMENTAL_COVERAGE_FIELDS = (
+    "trailing_pe", "forward_pe", "peg", "earnings_growth_pct",
+    "revenue_growth_pct", "profit_margin_pct", "debt_to_equity",
+    "price_to_book", "dividend_yield_pct",
+)
+_TECHNICAL_COVERAGE_FIELDS = (
+    "fifty_day_average", "two_hundred_day_average", "fifty_two_week_high",
+)
+
+
+def report_data_quality(holdings: list[dict]) -> dict:
+    """Quantify whether the report has enough data to support its labels."""
+    total = len(holdings)
+
+    def percentage(count: int) -> float:
+        return count / total * 100 if total else 100.0
+
+    fundamentals = 0
+    technicals = 0
+    classifications = 0
+    factors = 0
+    for row in holdings:
+        facts = row.get("fundamentals") or {}
+        if sum(facts.get(field) is not None for field in _FUNDAMENTAL_COVERAGE_FIELDS) >= 2:
+            fundamentals += 1
+        if any(facts.get(field) is not None for field in _TECHNICAL_COVERAGE_FIELDS):
+            technicals += 1
+        if (
+            str(row.get("sector") or "Unclassified") != "Unclassified"
+            and str(row.get("region") or "Unclassified") != "Unclassified"
+        ):
+            classifications += 1
+        if row.get("factors"):
+            factors += 1
+    return {
+        "holdings": total,
+        "fundamentals_count": fundamentals,
+        "fundamentals_pct": percentage(fundamentals),
+        "technical_count": technicals,
+        "technical_pct": percentage(technicals),
+        "classification_count": classifications,
+        "classification_pct": percentage(classifications),
+        "factor_count": factors,
+        "factor_pct": percentage(factors),
+    }
+
+
+def validate_report_data_quality(
+    report: dict,
+    *,
+    min_fundamentals_pct: float = 50,
+    min_technical_pct: float = 80,
+    min_classification_pct: float = 90,
+) -> None:
+    """Fail closed instead of publishing a technically valid useless report."""
+    quality = report.get("data_quality") or report_data_quality(
+        report.get("holdings") or []
+    )
+    failures = []
+    for label, actual, minimum in (
+        ("fundamentals", quality["fundamentals_pct"], min_fundamentals_pct),
+        ("technicals", quality["technical_pct"], min_technical_pct),
+        ("classification", quality["classification_pct"], min_classification_pct),
+    ):
+        if actual < minimum:
+            failures.append(f"{label} {actual:.1f}% < {minimum:.1f}%")
+    if failures:
+        raise PortfolioDataQualityError(
+            "Portfolio data quality check failed: " + "; ".join(failures)
+        )
+
+
 def build_report(positions: list[dict], candidates: list[dict] | None = None,
                  *, base_currency: str = "USD", deployable_cash: float = 0,
                  max_position_pct: float = 20, max_sector_pct: float = 35,
@@ -1356,6 +1593,7 @@ def build_report(positions: list[dict], candidates: list[dict] | None = None,
         reverse=True,
     )
     research = [row for row in analysed if not row.get("is_holding")]
+    data_quality = report_data_quality(holdings)
     top_three = (
         sum(row.get("allocation_pct") or 0 for row in holdings[:3])
         if summary["account_value_complete"] else None
@@ -1433,6 +1671,7 @@ def build_report(positions: list[dict], candidates: list[dict] | None = None,
         "summary": summary,
         "holdings": holdings,
         "research_candidates": research,
+        "data_quality": data_quality,
         "sector_exposure": sectors,
         "sector_allocation": sector_allocation,
         "region_exposure": regions,
@@ -1476,6 +1715,7 @@ def _exposure_line(values: dict[str, float]) -> str:
 def format_view(report: dict) -> str:
     """Render the user's comprehensive, evidence-first daily portfolio view."""
     summary = report["summary"]
+    quality = report.get("data_quality") or {}
     currency = summary["base_currency"]
     lines = [f"*IBKR DAILY VIEW — {report['as_of']}*", ""]
     lines.append("*1. Portfolio snapshot*")
@@ -1518,6 +1758,10 @@ def format_view(report: dict) -> str:
         f"- Realized P&L: {_money(summary['realized_pnl'], currency, summary['realized_pnl_complete'])}",
         f"- Combined supplied P&L: "
         f"{_money(summary['total_profit'], currency, summary['total_profit_complete'])}",
+        f"- Analytical coverage: fundamentals "
+        f"{quality.get('fundamentals_pct', 0):.1f}%; technicals "
+        f"{quality.get('technical_pct', 0):.1f}%; classifications "
+        f"{quality.get('classification_pct', 0):.1f}%",
         "",
         "*2. Holdings — size, performance, valuation and call*",
     ]
@@ -1673,7 +1917,7 @@ def configured_positions() -> list[dict]:
 
 def build_configured_report() -> dict:
     positions, broker_nav = _configured_positions_and_nav()
-    return build_report(
+    report = build_report(
         positions,
         config.PORTFOLIO_VIEW_CANDIDATES,
         base_currency=config.PORTFOLIO_VIEW_BASE_CURRENCY,
@@ -1685,6 +1929,18 @@ def build_configured_report() -> dict:
         headline_fetcher=brief.fetch_headlines,
         broker_nav=broker_nav,
     )
+    if config.PORTFOLIO_VIEW_REQUIRE_DATA_QUALITY:
+        validate_report_data_quality(
+            report,
+            min_fundamentals_pct=(
+                config.PORTFOLIO_VIEW_MIN_FUNDAMENTALS_COVERAGE_PCT
+            ),
+            min_technical_pct=config.PORTFOLIO_VIEW_MIN_TECHNICAL_COVERAGE_PCT,
+            min_classification_pct=(
+                config.PORTFOLIO_VIEW_MIN_CLASSIFICATION_COVERAGE_PCT
+            ),
+        )
+    return report
 
 
 async def run_and_notify(sender=None) -> str:
