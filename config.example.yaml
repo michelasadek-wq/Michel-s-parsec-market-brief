@@ -65,6 +65,12 @@ portfolio_view:
   max_sector_pct: 35
   min_buy_score: 3
   max_snapshot_age_days: 3     # stale holdings force HOLD and block deployment
+  # Optional fail-closed gate for automated delivery. When enabled, a report
+  # with collapsed enrichment is rejected instead of published as all-HOLD.
+  require_data_quality: false
+  min_fundamentals_coverage_pct: 50
+  min_technical_coverage_pct: 80
+  min_classification_coverage_pct: 90
 
   # Use these metadata rows to classify IBKR Flex/CSV holdings. In Flex mode
   # they are metadata only; otherwise quantity and average_cost can make them
