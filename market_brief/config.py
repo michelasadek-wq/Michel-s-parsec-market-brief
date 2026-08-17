@@ -427,6 +427,25 @@ PORTFOLIO_VIEW_MAX_SNAPSHOT_AGE_DAYS: int = _positive_int(
     "max_snapshot_age_days",
     "portfolio_view",
 )
+PORTFOLIO_VIEW_REQUIRE_DATA_QUALITY: bool = bool(
+    _view_cfg.get("require_data_quality", False)
+)
+
+
+def _coverage_threshold(key: str, default: float) -> float:
+    value = _optional_float(_view_cfg.get(key, default), key, "portfolio_view")
+    return min(100.0, max(0.0, default if value is None else value))
+
+
+PORTFOLIO_VIEW_MIN_FUNDAMENTALS_COVERAGE_PCT: float = _coverage_threshold(
+    "min_fundamentals_coverage_pct", 50
+)
+PORTFOLIO_VIEW_MIN_TECHNICAL_COVERAGE_PCT: float = _coverage_threshold(
+    "min_technical_coverage_pct", 80
+)
+PORTFOLIO_VIEW_MIN_CLASSIFICATION_COVERAGE_PCT: float = _coverage_threshold(
+    "min_classification_coverage_pct", 90
+)
 
 
 # ── delivery ────────────────────────────────────────────────────────
