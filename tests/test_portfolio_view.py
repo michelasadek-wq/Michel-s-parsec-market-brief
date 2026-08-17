@@ -635,6 +635,10 @@ class TestRenderingAndDelivery:
 
 
 class TestPublicDataParsing:
+    def test_position_numbers_do_not_overwrite_market_data_attribution(self):
+        merged = portfolio_view._merge_fundamentals(_row(), _facts())
+        assert merged["source"] == "test"
+
     def test_data_quality_gate_rejects_degraded_report(self):
         report = {
             "holdings": [{
