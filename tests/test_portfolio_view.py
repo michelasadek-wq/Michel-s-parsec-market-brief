@@ -635,26 +635,91 @@ class TestRenderingAndDelivery:
 
 
 class TestPublicDataParsing:
+    def test_data_quality_gate_rejects_degraded_report(self):
+        report = {
+            "holdings": [{
+                "sector": "Unclassified",
+                "region": "Unclassified",
+                "factors": [],
+                "fundamentals": {},
+            }]
+        }
+        with pytest.raises(
+            portfolio_view.PortfolioDataQualityError,
+            match="fundamentals 0.0%.*technicals 0.0%.*classification 0.0%",
+        ):
+            portfolio_view.validate_report_data_quality(report)
+
+    def test_data_quality_gate_accepts_covered_report(self):
+        report = {
+            "holdings": [{
+                "sector": "Technology",
+                "region": "United States",
+                "factors": ["Quality"],
+                "fundamentals": {
+                    "trailing_pe": 20,
+                    "profit_margin_pct": 25,
+                    "two_hundred_day_average": 150,
+                },
+            }]
+        }
+        portfolio_view.validate_report_data_quality(report)
+
     def test_fundamentals_fetch_is_mocked(self):
-        response = MagicMock()
-        response.raise_for_status = MagicMock()
-        response.json.return_value = {"quoteResponse": {"result": [{
-            "trailingPE": 30,
-            "forwardPE": 24,
-            "epsTrailingTwelveMonths": 5,
-            "epsForward": 6,
-            "fiftyDayAverage": 145,
-            "twoHundredDayAverage": 130,
-            "fiftyTwoWeekHigh": 160,
-            "marketCap": 3000000000000,
-            "regularMarketTime": 1786665600,
+        chart = MagicMock()
+        chart.raise_for_status = MagicMock()
+        chart.json.return_value = {"chart": {"result": [{
+            "meta": {
+                "regularMarketPrice": 150,
+                "regularMarketTime": 1786665600,
+                "fiftyTwoWeekHigh": 160,
+                "fiftyTwoWeekLow": 90,
+            },
+            "indicators": {"quote": [{"close": list(range(1, 201))}]},
+            "events": {"dividends": {"1": {"amount": 1.5}}},
         }]}}
-        with patch("market_brief.portfolio_view.httpx.get", return_value=response):
+        series = MagicMock()
+        series.raise_for_status = MagicMock()
+
+        def block(name, values):
+            return {
+                "meta": {"type": [name]},
+                name: [
+                    {
+                        "asOfDate": f"2026-0{index + 1}-01",
+                        "currencyCode": "USD",
+                        "reportedValue": {"raw": value},
+                    }
+                    for index, value in enumerate(values)
+                ],
+            }
+
+        series.json.return_value = {"timeseries": {"result": [
+            block("trailingPeRatio", [30]),
+            block("trailingForwardPeRatio", [24]),
+            block("quarterlyDilutedEPS", [1, 1.1, 1.1, 1.1, 1.2]),
+            block("quarterlyTotalRevenue", [100, 105, 108, 112, 120]),
+            block("trailingTotalRevenue", [500]),
+            block("trailingNetIncome", [125]),
+            block("quarterlyTotalDebt", [50]),
+            block("quarterlyStockholdersEquity", [200]),
+            block("trailingMarketCap", [3000]),
+        ]}}
+        with patch(
+            "market_brief.portfolio_view.httpx.get",
+            side_effect=[chart, series],
+        ):
             facts = portfolio_view.fetch_fundamentals("AAPL")
         assert facts["ok"] is True
         assert facts["forward_pe"] == 24
         assert facts["earnings_growth_pct"] == pytest.approx(20)
         assert facts["peg"] == pytest.approx(1.2)
+        assert facts["revenue_growth_pct"] == pytest.approx(20)
+        assert facts["profit_margin_pct"] == pytest.approx(25)
+        assert facts["debt_to_equity"] == pytest.approx(25)
+        assert facts["price_to_book"] == pytest.approx(15)
+        assert facts["two_hundred_day_average"] == pytest.approx(100.5)
+        assert facts["dividend_yield_pct"] == pytest.approx(1)
 
     def test_fx_tries_inverse_when_direct_is_missing(self):
         missing = MagicMock()
