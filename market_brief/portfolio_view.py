@@ -972,7 +972,11 @@ def _merge_fundamentals(row: dict, fetched: dict) -> dict:
     """Config overrides win over public data and remain explicitly sourced."""
     merged = dict(fetched)
     supplied = False
-    for field in _NUMBER_FIELDS:
+    position_fields = {
+        "quantity", "average_cost", "current_price", "market_value",
+        "unrealized_pnl", "realized_pnl",
+    }
+    for field in _NUMBER_FIELDS - position_fields:
         if row.get(field) is not None:
             merged[field] = row[field]
             supplied = True
