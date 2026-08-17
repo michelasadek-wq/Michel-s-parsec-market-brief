@@ -1,8 +1,8 @@
-"""Market brief — daily pre-market watchlist monitor.
+"""Market brief — U.S.-first daily global-market monitor.
 
-Scans Saudi/Egypt/US/UK news feeds plus Yahoo close prices for the symbols on
-the configured watchlist, then writes a short "what moved · what changed · what
-to ignore" digest.
+Scans U.S. and major global-market feeds plus Yahoo close prices for the
+configured watchlist, then writes a short "what moved · what changed · what to
+ignore" digest.
 
 MONITORING ONLY. This module never produces investment advice: the compose
 prompt forbids buy/sell/hold calls, price targets, and conviction language, and
@@ -23,6 +23,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
+from urllib.parse import quote
 
 import httpx
 
@@ -40,8 +41,8 @@ _SEEN_TTL_DAYS = 14
 #: prompt so a story that resurfaces under a new headline is not re-reported.
 _BRIEFS_DIR = config.DATA_DIR / "briefs"
 
-# Every fetch goes out with a browser UA + Accept. Argaam and Google News both
-# serve junk (or nothing) to a default client UA.
+# Every fetch goes out with a browser UA + Accept. Several public finance feeds
+# serve reduced or non-XML responses to a default client UA.
 _HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -52,42 +53,59 @@ _HTTP_HEADERS = {
 
 _HTTP_TIMEOUT = 15
 
-# News sources — (label, url, is_disclosure, require_xml).
-#
-# `is_disclosure` marks the regulator-filing feed; those items outrank ordinary
-# coverage in the candidate pool. `require_xml` marks feeds that answer a bad
-# path with a 200 + HTML page instead of an error: Argaam does exactly that, so
-# its content-type is asserted before parsing rather than letting ElementTree
-# fail on a <!DOCTYPE html> body and look like a transient outage.
+# Base news sources — (label, url, is_disclosure, require_xml). Per-symbol Yahoo
+# feeds are added at runtime from the configured watchlist, so U.S. and global
+# holdings receive first-class coverage without hard-coded ticker assumptions.
+# `require_xml` protects against endpoints that return an HTML page with HTTP
+# 200; those responses are rejected before parsing.
 FEEDS = [
-    ("Argaam: disclosures",
-     "https://www.argaam.com/en/rss/ho-company-disclosures?sectionid=244",
-     True, True),
-    ("Argaam: market news",
-     "https://www.argaam.com/en/rss/ho-main-news?sectionid=1524",
-     False, True),
-    ("Google News: Tadawul",
-     'https://news.google.com/rss/search?q="تداول" OR "السوق السعودي" when:1d'
-     "&hl=ar&gl=SA&ceid=SA:ar",
+    ("Federal Reserve: press releases",
+     "https://www.federalreserve.gov/feeds/press_all.xml", True, True),
+    ("Google News: U.S. markets",
+     "https://news.google.com/rss/search?q=%28S%26P+500+OR+Nasdaq+OR+Dow%29+"
+     "when%3A1d&hl=en-US&gl=US&ceid=US%3Aen", False, False),
+    ("Google News: U.S. macro",
+     "https://news.google.com/rss/search?q=%28Federal+Reserve+OR+Treasury+yield+"
+     "OR+U.S.+inflation+OR+jobs+report%29+when%3A1d&hl=en-US&gl=US&ceid=US%3Aen",
      False, False),
-    ("Google News: EGX",
-     'https://news.google.com/rss/search?q=Fawry OR "فوري" OR EGX when:2d'
-     "&hl=en-EG&gl=EG&ceid=EG:en",
-     False, False),
-    ("Google News: macro",
-     'https://news.google.com/rss/search?q=Trump tariff OR "executive order" '
-     "market OR Fed rate when:1d&hl=en-US&gl=US&ceid=US:en",
-     False, False),
-    ("Google News: CBE",
-     'https://news.google.com/rss/search?q="المركزي المصري" OR "البنك المركزي" '
-     "فائدة when:2d&hl=ar&gl=EG&ceid=EG:ar",
-     False, False),
-    ("EnterpriseAM", "https://enterpriseam.com/feed/", False, False),
-    ("Yahoo: TSM", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSM",
-     False, False),
-    ("Yahoo: AVGO", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AVGO",
+    ("Google News: Europe markets",
+     "https://news.google.com/rss/search?q=%28STOXX+600+OR+FTSE+100+OR+DAX+OR+"
+     "ECB%29+when%3A1d&hl=en-GB&gl=GB&ceid=GB%3Aen", False, False),
+    ("Google News: Asia-Pacific markets",
+     "https://news.google.com/rss/search?q=%28Nikkei+225+OR+Hang+Seng+OR+CSI+300+"
+     "OR+ASX+200%29+when%3A1d&hl=en-US&gl=US&ceid=US%3Aen", False, False),
+    ("Google News: global macro",
+     "https://news.google.com/rss/search?q=%28oil+OR+dollar+index+OR+global+"
+     "markets+OR+trade+tariff%29+when%3A1d&hl=en-US&gl=US&ceid=US%3Aen",
      False, False),
 ]
+
+_MAX_TICKER_FEEDS = 30
+
+
+def feeds_for_watchlist(watchlist: list[dict] | None = None) -> list[tuple]:
+    """Base feeds plus one Yahoo headline feed per unique priced symbol.
+
+    Dynamic feeds keep the monitor portfolio-led: a Tokyo, London, Frankfurt,
+    Toronto, Hong Kong, or U.S. symbol gets the same ticker-specific treatment.
+    The cap bounds runtime for unusually large lists.
+    """
+    feeds = list(FEEDS)
+    seen: set[str] = set()
+    for entry in watchlist or []:
+        symbol = str(entry.get("symbol", "")).strip()
+        if not symbol or entry.get("news_only") or symbol in seen:
+            continue
+        seen.add(symbol)
+        feeds.append((
+            f"Yahoo: {symbol}",
+            f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote(symbol)}",
+            False,
+            False,
+        ))
+        if len(seen) >= _MAX_TICKER_FEEDS:
+            break
+    return feeds
 
 # Yahoo's public chart endpoint — two daily closes are all the price layer
 # needs, and it costs no dependency (yfinance would).
@@ -100,7 +118,7 @@ _YAHOO_CHART_URL = (
 # move, so a 2% gate would mean they never appear at all.
 _MOVE_THRESHOLD_DEFAULT = 2.0
 _MOVE_THRESHOLD_LOW_BETA = 1.0
-_LOW_BETA_SYMBOLS = {"VWRA.L", "9404.SR"}
+_LOW_BETA_SYMBOLS = {"AGG", "BND", "VTI", "VOO", "VT", "VWRA.L"}
 
 # Candidate-pool ordering: a regulator filing about a held name beats press
 # coverage of it, which beats macro/policy background.
@@ -213,7 +231,7 @@ def parse_feed(xml_text: str, label: str, is_disclosure: bool = False,
                 # itertext(), not .text: a feed that ships raw (well-formed)
                 # markup inside <description> parses into child ELEMENTS, so
                 # .text is None and the summary would silently come out empty.
-                # EnterpriseAM's full-text <content:encoded> is the case here.
+                # Some publisher feeds use full-text <content:encoded> blocks.
                 summary = _strip_html("".join(child.itertext()))[:300]
         if not title or not link:
             continue
@@ -239,9 +257,9 @@ def _fetch_feed(label: str, url: str, is_disclosure: bool,
         )
         resp.raise_for_status()
         if require_xml:
-            # Argaam answers a wrong/renamed feed path with its normal HTML
-            # site at HTTP 200. Without this the brief would silently lose the
-            # disclosure feed and nobody would see an error.
+            # Some publishers answer a wrong or renamed feed path with a normal
+            # HTML page at HTTP 200. Reject it loudly instead of silently losing
+            # a source.
             ctype = (resp.headers.get("content-type") or "").lower()
             if "xml" not in ctype:
                 logger.warning(
@@ -255,12 +273,13 @@ def _fetch_feed(label: str, url: str, is_disclosure: bool,
         return []
 
 
-def fetch_headlines() -> list[dict]:
+def fetch_headlines(watchlist: list[dict] | None = None) -> list[dict]:
     """Fetch every configured feed. One dead feed never kills the brief."""
     items = []
-    for label, url, is_disclosure, require_xml in FEEDS:
+    feeds = feeds_for_watchlist(watchlist)
+    for label, url, is_disclosure, require_xml in feeds:
         items.extend(_fetch_feed(label, url, is_disclosure, require_xml))
-    logger.info(f"Market brief: {len(items)} raw headlines from {len(FEEDS)} feeds")
+    logger.info(f"Market brief: {len(items)} raw headlines from {len(feeds)} feeds")
     return items
 
 
@@ -268,38 +287,26 @@ def _entry_terms(entry: dict) -> list[str]:
     """Every string that means "this watchlist entry" — symbol, name, aliases."""
     terms = [str(entry.get("symbol", "")), str(entry.get("name", ""))]
     terms += [str(a) for a in entry.get("aliases", [])]
-    # The bare ticker root ("1180.SR" → "1180") is how the Arabic press writes
-    # a Tadawul name, and how the ETF entries are aliased.
+    # The bare ticker root ("7203.T" → "7203") is common in local exchange
+    # coverage and ETF references.
     symbol = str(entry.get("symbol", ""))
     if "." in symbol:
         terms.append(symbol.split(".")[0])
     return [t.strip() for t in terms if t and t.strip()]
 
 
-#: Arabic block — used to decide whether the definite article may prefix a term.
-_ARABIC_CHAR = re.compile(r"[؀-ۿ]")
-
-
 def _matches(term: str, haystack: str) -> bool:
     """Whole-token, case-insensitive match of `term` inside `haystack`.
 
-    A plain substring test is wrong here: the watchlist carries three- and
-    four-character names ("stc", "SNB", "9404") that occur inside ordinary
+    A plain substring test is wrong here: the watchlist carries short names
+    ("AI", "CAT", "ON") that occur inside ordinary
     words and numbers, and every false positive costs a slot in a capped brief.
-    Lookarounds rather than \\b so terms ending in punctuation ("1180.SR") still
-    anchor correctly. Arabic is unaffected by IGNORECASE and matches literally.
-
-    Arabic terms additionally accept the attached definite article: the press
-    writes "الأسمدة", never the bare "أسمدة", and ال is glued to the word so a
-    token boundary alone would miss every real headline. Optional, so a term
-    already carrying it ("المركزي المصري") still matches as written.
+    Lookarounds rather than \\b allow terms ending in exchange suffix punctuation
+    (for example ``7203.T``) to anchor correctly.
     """
     if not term:
         return False
-    core = re.escape(term)
-    if _ARABIC_CHAR.match(term):
-        core = r"(?:ال)?" + core
-    pattern = r"(?<!\w)" + core + r"(?!\w)"
+    pattern = r"(?<!\w)" + re.escape(term) + r"(?!\w)"
     return re.search(pattern, haystack, re.IGNORECASE) is not None
 
 
@@ -309,9 +316,8 @@ def filter_items(items: list[dict], watchlist: list[dict],
     """Keep only items about a watchlist name or a macro keyword, then rank.
 
     Matching is whole-token and case-insensitive on title + summary, and covers
-    Arabic aliases (which match literally). Ranking is disclosures first, then
-    ticker-specific coverage, then macro/policy background, so the cap trims the
-    least specific items.
+    aliases. Ranking is official releases first, then ticker-specific coverage,
+    then macro/policy background, so the cap trims the least specific items.
     """
     kept = []
     keywords = [str(k).strip() for k in macro_keywords if str(k).strip()]
@@ -352,8 +358,8 @@ def fetch_quote(symbol: str) -> dict:
     """Last close vs previous close for one symbol via Yahoo's chart endpoint.
 
     Never raises: a delisted/renamed/unknown symbol comes back as ``ok: False``
-    and the brief prints "price unavailable" for it. EGX symbols are the ones
-    most likely to be wrong — on Yahoo they are ISIN-based, not ticker-based.
+    and the brief prints "price unavailable" for it. Exchange suffixes are
+    preserved exactly; the monitor never guesses a local listing symbol.
     """
     quote = {
         "symbol": symbol,
@@ -386,8 +392,8 @@ def fetch_quote(symbol: str) -> dict:
         if len(closes) >= 2:
             last, prev = closes[-1], closes[-2]
         else:
-            # EGX symbols return a single bar regardless of range; the meta
-            # block still carries both marks (verified live for EGS745L1C014.CA).
+            # Some thin or non-U.S. listings return one usable bar for a short
+            # range; Yahoo's metadata may still carry both closing marks.
             last, prev = meta.get("regularMarketPrice"), meta.get("chartPreviousClose")
             if not (isinstance(last, (int, float)) and isinstance(prev, (int, float))):
                 logger.info(f"Market brief: fewer than 2 closes for {symbol}")
@@ -451,7 +457,7 @@ def scan() -> dict:
 
     prices = fetch_prices(watchlist)
 
-    raw = fetch_headlines()
+    raw = fetch_headlines(watchlist)
     fresh = [i for i in raw if _mark_if_new(seen, i.get("url", ""), today)]
     items = filter_items(
         fresh,
@@ -550,7 +556,8 @@ You are writing the *daily pre-market brief* — a short message for one person,
 about the instruments he already holds or watches. He wants situational \
 awareness before the market opens: what moved, what changed, what to ignore.
 
-ABSOLUTE GUARDRAIL — this is a MONITORING brief, never advice:
+ABSOLUTE GUARDRAIL — this is the MONITORING brief, never advice. The separate
+IBKR Daily View is the portfolio decision-support surface; do not imitate it:
 - NEVER write a buy, sell, hold, add, trim, exit, or "take profit" call, in any wording.
 - NEVER give a price target, fair value, entry/exit level, or forecast.
 - NEVER use conviction language ("strong", "attractive", "cheap", "overvalued", \
@@ -580,11 +587,11 @@ RECENT BRIEFS (do not repeat these — same story, same angle = skip):
 {recent_briefs}
 
 Write it like this:
-- First line: `*📊 موجز السوق*` then the date.
+- First line: `*📊 Market brief*` then the date.
 - Lead with the single most important thing that happened, one or two lines.
-- Then short bullets grouped by market (Tadawul, EGX, US, Global) — only the \
-markets that actually have something. One line each: what moved or what changed, \
-and the one fact behind it.
+- Then short bullets grouped by market (U.S., Europe, Asia-Pacific, Global) — \
+only the markets that actually have something. One line each: what moved or \
+what changed, and the one fact behind it.
 - If, and ONLY if, the SMART MONEY block above has content, add one short \
 `*Smart money:*` line stating what was filed. If it says "(nothing new)", omit \
 the section entirely — do not mention 13Fs, do not say it was quiet.

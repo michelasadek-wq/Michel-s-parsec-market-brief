@@ -1,14 +1,13 @@
-"""CLI: ``python -m market_brief --once``.
+"""CLI for the market brief and the separate IBKR Daily View.
 
-One run, one brief, printed to the console. That is the whole surface — there
-is no daemon here on purpose: scheduling belongs to cron, systemd timers, or
-whatever the deployment already uses, and a monitor that cannot be run by hand
-cannot be trusted.
+One run, one or two reports, printed to the console. There is no daemon here on
+purpose: scheduling belongs to cron, systemd timers, or the deployment layer.
 """
 
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
 from . import brief, config
@@ -33,12 +32,21 @@ def _configure_logging(verbose: bool):
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="python -m market_brief",
-        description="Daily pre-market watchlist monitor. Monitoring only — "
-                    "this tool never emits buy/sell calls or price targets.",
+        description="U.S.-first global market monitor plus an optional, "
+                    "local-first IBKR portfolio view.",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--once", action="store_true",
-        help="Run the pipeline once and print the brief (default).",
+        help="Run the monitoring brief once (default).",
+    )
+    mode.add_argument(
+        "--view", action="store_true",
+        help="Run the comprehensive IBKR Daily View only.",
+    )
+    mode.add_argument(
+        "--all", action="store_true",
+        help="Run the market brief and the IBKR Daily View.",
     )
     parser.add_argument(
         "--no-compose", action="store_true",
@@ -52,14 +60,22 @@ def _parse_args(argv=None):
 
 
 async def _run(args) -> int:
-    runner = None
-    if not args.no_compose:
-        from . import claude
-        runner = claude.get_runner()
+    requested_brief = args.once or args.all or not (args.view or args.all)
+    requested_view = args.view or args.all
+    run_brief = requested_brief and config.MARKET_BRIEF_ENABLED
+    run_view = requested_view and config.PORTFOLIO_VIEW_ENABLED
+    if run_brief and config.MARKET_BRIEF_WATCHLIST:
+        runner = None
+        if not args.no_compose:
+            from . import claude
+            runner = claude.get_runner()
+        text = await brief.run_scan_and_notify(claude_runner=runner)
+        if not text:
+            print("Nothing to report in the market brief today.")
 
-    text = await brief.run_scan_and_notify(claude_runner=runner)
-    if not text:
-        print("Nothing to report today.")
+    if run_view:
+        from . import portfolio_view
+        await portfolio_view.run_and_notify()
     return 0
 
 
@@ -67,11 +83,67 @@ def main(argv=None) -> int:
     args = _parse_args(argv)
     _configure_logging(args.verbose)
 
-    if not config.MARKET_BRIEF_WATCHLIST:
+    requested_brief = args.once or args.all or not (args.view or args.all)
+    requested_view = args.view or args.all
+    run_brief = requested_brief and config.MARKET_BRIEF_ENABLED
+    run_view = requested_view and config.PORTFOLIO_VIEW_ENABLED
+    disabled = []
+    if requested_brief and not config.MARKET_BRIEF_ENABLED:
+        disabled.append("market_brief.enabled")
+    if requested_view and not config.PORTFOLIO_VIEW_ENABLED:
+        disabled.append("portfolio_view.enabled")
+    if disabled and not (run_brief or run_view):
+        print(
+            "Requested report is disabled — set " + " and ".join(disabled)
+            + " to true in config.yaml.",
+            file=sys.stderr,
+        )
+        return 2
+    if disabled:
+        print(
+            "Skipping disabled report(s): " + ", ".join(disabled) + ".",
+            file=sys.stderr,
+        )
+
+    flex_enabled = config.PORTFOLIO_VIEW_IBKR_FLEX_ENABLED
+    missing_flex_env = [
+        name for name in ("IBKR_FLEX_TOKEN", "IBKR_FLEX_QUERY_ID")
+        if flex_enabled and not os.environ.get(name, "").strip()
+    ]
+    has_view_input = bool(
+        config.PORTFOLIO_VIEW_POSITIONS
+        or config.PORTFOLIO_VIEW_CANDIDATES
+        or (flex_enabled and not missing_flex_env)
+        or (
+            config.PORTFOLIO_VIEW_IBKR_CSV
+            and config.PORTFOLIO_VIEW_IBKR_CSV.exists()
+        )
+    )
+    if run_brief and not config.MARKET_BRIEF_WATCHLIST and not run_view:
         print(
             "Watchlist is empty — nothing to monitor.\n"
             "Copy config.example.yaml to config.yaml and add the instruments "
             "you want watched.",
+            file=sys.stderr,
+        )
+        return 2
+    if run_view and missing_flex_env:
+        print(
+            "IBKR Flex input is enabled but required environment variables "
+            "are missing: " + ", ".join(missing_flex_env) + ".",
+            file=sys.stderr,
+        )
+        return 2
+    if run_view and not has_view_input:
+        configured_path = config.PORTFOLIO_VIEW_IBKR_CSV
+        if configured_path and not configured_path.exists():
+            detail = f" Configured CSV does not exist: {configured_path}."
+        else:
+            detail = ""
+        print(
+            "Portfolio View has no input — enable portfolio_view.ibkr_flex, "
+            "set portfolio_view.ibkr_csv, or add portfolio_view.positions in "
+            "config.yaml." + detail,
             file=sys.stderr,
         )
         return 2

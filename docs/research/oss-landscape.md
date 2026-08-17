@@ -13,4 +13,9 @@
 | ginlix-ai/LangAlpha | 1.6k | active | "Claude Code for markets" — **took: the morning-brief widget concept + compounding brief archive** (each day's brief informs the next). |
 | daily-watchlist (Claude skill) | 57 | small | Exactly our shape in miniature — **took: report template ideas + source fallback chains.** |
 
-**Conclusion:** the "RSS → model → chat brief" shape is a commodity; the differentiation is source quality for MENA markets (nobody covers Tadawul/EGX properly — see sources-evaluation.md), Arabic-native matching, and the no-signals guardrail. We built exactly that and skipped everyone else's shared bet that a model can pick trades.
+**Conclusion:** the "RSS → model → chat brief" shape is a commodity. The useful
+differentiation is portfolio-led U.S./global filtering, dynamic ticker feeds,
+private IBKR P&L and exposure analysis, explicit data provenance, and a hard
+separation between the monitoring brief and the transparent decision screen.
+We kept those pieces and skipped the shared bet that model debate can reliably
+pick trades from stale headlines.
