@@ -1,7 +1,7 @@
-"""Tests for the daily market brief — feed parsing (incl. the Argaam
-returns-HTML trap), seen-set dedup + TTL prune, entity/macro filtering with
-Arabic aliases, price math and move thresholds, the compose guard, and
-watchlist config parsing.
+"""Tests for the market brief — feed parsing (incl. the HTML-at-200 trap),
+seen-set dedup + TTL prune + persist-after-delivery, entity/macro filtering,
+price math and move thresholds, the compose guard, radar wiring, and watchlist
+config parsing.
 
 No network: every fetch is mocked, every feed comes from a fixture string.
 """
@@ -20,17 +20,17 @@ from market_brief import config
 
 
 WATCHLIST = [
-    {"symbol": "1180.SR", "name": "Saudi National Bank",
-     "aliases": ["SNB", "الأهلي السعودي"], "market": "tadawul", "watch_only": False},
-    {"symbol": "9404.SR", "name": "Alinma Govt Sukuk ETF",
-     "aliases": ["9404"], "market": "tadawul", "watch_only": False},
-    {"symbol": "EGS745L1C014.CA", "name": "Fawry",
-     "aliases": ["FWRY", "فوري"], "market": "egx", "watch_only": False},
     {"symbol": "TSM", "name": "TSMC",
      "aliases": ["Taiwan Semiconductor"], "market": "us", "watch_only": False},
+    {"symbol": "AVGO", "name": "Broadcom",
+     "aliases": ["Broadcom"], "market": "us", "watch_only": False},
+    {"symbol": "VWRA.L", "name": "Vanguard FTSE All-World (VWRA)",
+     "aliases": ["VWRA"], "market": "lse", "watch_only": False},
+    {"symbol": "NVDA", "name": "NVIDIA",
+     "aliases": ["Nvidia"], "market": "us", "watch_only": False},
 ]
 
-MACRO_KEYWORDS = ["cbe", "المركزي المصري", "fed rate", "trump tariff"]
+MACRO_KEYWORDS = ["fed rate", "trump tariff", "cpi", "treasury yields"]
 
 
 def _rss(items: list[tuple[str, str, str]]) -> str:
@@ -61,9 +61,9 @@ def _atom(items: list[tuple[str, str, str]]) -> str:
     )
 
 
-#: What Argaam actually serves on a bad/renamed feed path: HTTP 200, HTML body.
-ARGAAM_HTML_TRAP = (
-    "<!DOCTYPE html><html><head><title>Argaam</title></head>"
+#: What a misbehaving feed host serves on a bad/renamed path: HTTP 200, HTML.
+HTML_TRAP = (
+    "<!DOCTYPE html><html><head><title>News site</title></head>"
     "<body><div class='news'>Latest news</div></body></html>"
 )
 
@@ -78,7 +78,7 @@ def _mock_response(text: str, content_type: str = "application/rss+xml",
     return resp
 
 
-def _chart_payload(closes: list, currency: str = "SAR") -> dict:
+def _chart_payload(closes: list, currency: str = "USD") -> dict:
     return {
         "chart": {
             "result": [{
@@ -104,6 +104,9 @@ def watchlist_config(monkeypatch):
     monkeypatch.setattr(config, "MARKET_BRIEF_WATCHLIST", WATCHLIST)
     monkeypatch.setattr(config, "MARKET_BRIEF_MACRO_KEYWORDS", MACRO_KEYWORDS)
     monkeypatch.setattr(config, "MARKET_BRIEF_MAX_ITEMS", 25)
+    # Radar is exercised explicitly where it matters; keep it out of the
+    # generic pipeline fixtures so their fetch counts stay deterministic.
+    monkeypatch.setattr(config, "MARKET_BRIEF_RADAR_ENABLED", False)
 
 
 # ── parse_feed ──────────────────────────────────────────────────────
@@ -112,15 +115,15 @@ def watchlist_config(monkeypatch):
 class TestParseFeed:
     def test_parses_rss_fixture(self):
         xml = _rss([
-            ("Fawry reports Q2 results", "https://example.com/a", "EGX-listed Fawry said..."),
-            ("TASI closes higher", "https://example.com/b", "Tadawul index up 0.4%"),
+            ("TSMC reports Q2 results", "https://example.com/a", "TSMC said..."),
+            ("Nasdaq closes higher", "https://example.com/b", "Index up 0.4%"),
         ])
         items = market_brief.parse_feed(xml, "Test feed")
 
         assert len(items) == 2
-        assert items[0]["title"] == "Fawry reports Q2 results"
+        assert items[0]["title"] == "TSMC reports Q2 results"
         assert items[0]["url"] == "https://example.com/a"
-        assert items[0]["summary"].startswith("EGX-listed Fawry")
+        assert items[0]["summary"].startswith("TSMC said")
         assert items[0]["source"] == "Test feed"
         assert items[0]["is_disclosure"] is False
 
@@ -133,13 +136,13 @@ class TestParseFeed:
         assert items[0]["title"] == "Broadcom update"
 
     def test_disclosure_flag_is_carried(self):
-        xml = _rss([("SNB board disclosure", "https://example.com/d", "filing")])
-        items = market_brief.parse_feed(xml, "Argaam: disclosures", is_disclosure=True)
+        xml = _rss([("Board disclosure", "https://example.com/d", "filing")])
+        items = market_brief.parse_feed(xml, "Disclosures", is_disclosure=True)
         assert items[0]["is_disclosure"] is True
 
     def test_html_body_yields_no_items(self):
-        """The Argaam trap: an HTML page must never parse into headlines."""
-        assert market_brief.parse_feed(ARGAAM_HTML_TRAP, "Argaam: disclosures") == []
+        """The trap: an HTML page must never parse into headlines."""
+        assert market_brief.parse_feed(HTML_TRAP, "Broken feed") == []
 
     def test_items_without_title_or_link_are_skipped(self):
         xml = (
@@ -153,8 +156,8 @@ class TestParseFeed:
         assert [i["title"] for i in items] == ["Good"]
 
     def test_strips_html_from_summary(self):
-        xml = _rss([("T", "https://example.com/g", "<p>Fawry <b>rose</b></p>")])
-        assert market_brief.parse_feed(xml, "f")[0]["summary"] == "Fawry rose"
+        xml = _rss([("T", "https://example.com/g", "<p>TSMC <b>rose</b></p>")])
+        assert market_brief.parse_feed(xml, "f")[0]["summary"] == "TSMC rose"
 
 
 # ── _fetch_feed ─────────────────────────────────────────────────────
@@ -162,22 +165,20 @@ class TestParseFeed:
 
 class TestFetchFeed:
     def test_rejects_non_xml_content_type_when_required(self):
-        """Argaam answers a bad path with HTML at HTTP 200 — reject, don't parse."""
-        resp = _mock_response(ARGAAM_HTML_TRAP, content_type="text/html; charset=utf-8")
+        """A host that answers a bad path with HTML at HTTP 200 — reject it."""
+        resp = _mock_response(HTML_TRAP, content_type="text/html; charset=utf-8")
         with patch("httpx.get", return_value=resp):
             items = market_brief._fetch_feed(
-                "Argaam: disclosures", "https://www.argaam.com/en/rss/x",
-                True, True,
+                "Strict feed", "https://example.com/rss/x", True, True,
             )
         assert items == []
 
     def test_accepts_xml_content_type(self):
-        xml = _rss([("SNB disclosure", "https://example.com/h", "filing")])
+        xml = _rss([("Board disclosure", "https://example.com/h", "filing")])
         resp = _mock_response(xml, content_type="text/xml; charset=utf-8")
         with patch("httpx.get", return_value=resp):
             items = market_brief._fetch_feed(
-                "Argaam: disclosures", "https://www.argaam.com/en/rss/x",
-                True, True,
+                "Strict feed", "https://example.com/rss/x", True, True,
             )
         assert len(items) == 1
         assert items[0]["is_disclosure"] is True
@@ -191,18 +192,18 @@ class TestFetchFeed:
 
     def test_dead_feed_returns_empty(self):
         with patch("httpx.get", side_effect=RuntimeError("connection reset")):
-            assert market_brief._fetch_feed("EnterpriseAM", "https://e/feed/", False, False) == []
+            assert market_brief._fetch_feed("CNBC: markets", "https://c/feed/", False, False) == []
 
     def test_sends_browser_headers(self):
         resp = _mock_response(_rss([("t", "https://example.com/j", "d")]))
         with patch("httpx.get", return_value=resp) as mock_get:
-            market_brief._fetch_feed("EnterpriseAM", "https://e/feed/", False, False)
+            market_brief._fetch_feed("CNBC: markets", "https://c/feed/", False, False)
         headers = mock_get.call_args.kwargs["headers"]
         assert "Mozilla/5.0" in headers["User-Agent"]
         assert "xml" in headers["Accept"]
 
     def test_one_dead_feed_never_kills_the_scan(self):
-        good = _mock_response(_rss([("Fawry news", "https://example.com/k", "d")]))
+        good = _mock_response(_rss([("TSMC news", "https://example.com/k", "d")]))
 
         calls = {"n": 0}
 
@@ -263,6 +264,68 @@ class TestSeenSet:
         assert market_brief._load_seen() == {}
 
 
+# ── seen-set persistence timing ─────────────────────────────────────
+
+
+def _one_headline_pipeline(monkeypatch):
+    """Wire scan()'s fetchers to one matching headline and nothing else."""
+    monkeypatch.setattr(config, "today", lambda: date(2026, 8, 13))
+    monkeypatch.setattr(market_brief, "fetch_prices", lambda wl: [])
+    monkeypatch.setattr(
+        market_brief, "fetch_headlines",
+        lambda: [{"source": "Test", "title": "TSMC beats estimates",
+                  "url": "https://example.com/tsm", "summary": "",
+                  "is_disclosure": False}],
+    )
+    monkeypatch.setattr("market_brief.smart_money.collect_events", lambda: [])
+
+
+class TestSeenPersistenceTiming:
+    """A headline is only "consumed" once a brief was actually delivered.
+
+    scan() must NOT write the seen-set: a run that dies between scan and send
+    would otherwise eat that slot's headlines for the whole TTL window with
+    nothing ever reported.
+    """
+
+    def test_scan_does_not_persist_the_seen_set(self, seen_file, monkeypatch,
+                                                watchlist_config):
+        _one_headline_pipeline(monkeypatch)
+        data = market_brief.scan()
+
+        assert len(data["items"]) == 1
+        assert not seen_file.exists()          # nothing persisted yet
+        assert data["seen"]                    # but handed to the caller
+
+    @pytest.mark.asyncio
+    async def test_run_persists_the_seen_set_after_delivery(
+        self, seen_file, monkeypatch, watchlist_config, tmp_path
+    ):
+        _one_headline_pipeline(monkeypatch)
+        monkeypatch.setattr(market_brief, "_BRIEFS_DIR", tmp_path / "briefs")
+        sender = MagicMock()
+        sender.send = AsyncMock(return_value=True)
+
+        text = await market_brief.run_scan_and_notify(sender=sender)
+
+        assert "TSMC" in text
+        sender.send.assert_awaited_once()
+        saved = json.loads(seen_file.read_text(encoding="utf-8"))["seen"]
+        assert market_brief._url_hash("https://example.com/tsm") in saved
+
+    @pytest.mark.asyncio
+    async def test_interrupted_headlines_resurface_on_the_next_run(
+        self, seen_file, monkeypatch, watchlist_config
+    ):
+        """Simulates a crash after scan: nothing saved → next scan sees the
+        same headline as new instead of silently dropping it."""
+        _one_headline_pipeline(monkeypatch)
+        market_brief.scan()          # run 1 "crashed" before delivery
+        data = market_brief.scan()   # run 2
+
+        assert len(data["items"]) == 1
+
+
 # ── entity / macro filter ───────────────────────────────────────────
 
 
@@ -277,18 +340,12 @@ def _item(title, summary="", source="Test", is_disclosure=False):
 
 
 class TestFilterItems:
-    def test_matches_english_alias(self):
-        items = [_item("SNB posts higher quarterly profit")]
+    def test_matches_alias(self):
+        items = [_item("Broadcom lands new hyperscaler order")]
         kept = market_brief.filter_items(items, WATCHLIST, MACRO_KEYWORDS)
         assert len(kept) == 1
         assert kept[0]["rank"] == "ticker"
-        assert "Saudi National Bank" in kept[0]["matched"]
-
-    def test_matches_arabic_alias(self):
-        items = [_item("فوري تعلن نتائج الربع الثاني")]
-        kept = market_brief.filter_items(items, WATCHLIST, MACRO_KEYWORDS)
-        assert len(kept) == 1
-        assert "Fawry" in kept[0]["matched"]
+        assert "Broadcom" in kept[0]["matched"]
 
     def test_matches_name_case_insensitively(self):
         items = [_item("tsmc raises capex guidance")]
@@ -297,7 +354,8 @@ class TestFilterItems:
         assert "TSMC" in kept[0]["matched"]
 
     def test_matches_symbol_root(self):
-        items = [_item("Alinma 9404 sukuk ETF sees inflows")]
+        """"VWRA.L" should also match the bare "VWRA" the press writes."""
+        items = [_item("VWRA sees record weekly inflows")]
         kept = market_brief.filter_items(items, WATCHLIST, MACRO_KEYWORDS)
         assert len(kept) == 1
 
@@ -312,90 +370,52 @@ class TestFilterItems:
         assert len(kept) == 1
         assert kept[0]["rank"] == "macro"
 
-    def test_arabic_macro_keyword_match(self):
-        items = [_item("المركزي المصري يبقي على أسعار الفائدة")]
-        kept = market_brief.filter_items(items, WATCHLIST, MACRO_KEYWORDS)
-        assert len(kept) == 1
-        assert kept[0]["rank"] == "macro"
-
     def test_unrelated_item_is_dropped(self):
         items = [_item("Local football club signs new striker")]
         assert market_brief.filter_items(items, WATCHLIST, MACRO_KEYWORDS) == []
 
     def test_short_name_does_not_match_inside_a_word(self):
-        """"stc"/"SNB"/"9404" are short enough to hide inside ordinary words."""
-        wl = [{"symbol": "7010.SR", "name": "stc", "aliases": [], "market": "tadawul"}]
+        """Short tickers ("ARM", "CPI") hide inside ordinary words — a
+        substring match would flood the brief with false positives."""
+        wl = [{"symbol": "ARM", "name": "Arm Holdings", "aliases": [], "market": "us"}]
         items = [
-            _item("Distcount retailer opens in Riyadh"),
-            _item("Contractor SNBX wins tender"),
-            _item("Index at 19404 points"),
+            _item("Farmers brace for drought season"),
+            _item("Pharma giant beats estimates"),
+            _item("Consumers spent more on armchairs"),
         ]
-        assert market_brief.filter_items(items, wl + WATCHLIST, MACRO_KEYWORDS) == []
+        assert market_brief.filter_items(items, wl, []) == []
 
     def test_short_name_still_matches_as_a_word(self):
-        wl = [{"symbol": "7010.SR", "name": "stc", "aliases": [], "market": "tadawul"}]
-        items = [_item("stc reports subscriber growth")]
-        assert len(market_brief.filter_items(items, wl, MACRO_KEYWORDS)) == 1
+        wl = [{"symbol": "ARM", "name": "Arm Holdings", "aliases": [], "market": "us"}]
+        items = [_item("ARM reports record licensing revenue")]
+        assert len(market_brief.filter_items(items, wl, [])) == 1
 
     def test_disclosure_outranks_ticker_and_macro(self):
         items = [
             _item("Fed rate decision due Wednesday"),
             _item("TSMC in the press again"),
-            _item("SNB board disclosure filed", is_disclosure=True),
+            _item("Board disclosure filed for Broadcom", is_disclosure=True),
         ]
         kept = market_brief.filter_items(items, WATCHLIST, MACRO_KEYWORDS)
         assert [i["rank"] for i in kept] == ["disclosure", "ticker", "macro"]
 
-    def test_disclosure_mentioning_a_watchlist_name_is_kept(self):
-        """Tadawul major-holder moves arrive as Argaam disclosures — the entity
-        filter must never drop one that names a watchlist company."""
-        items = [_item(
-            "Saudi National Bank announces change in major shareholder holding",
-            summary="SNB disclosed a change in ownership above 5%.",
-            source="Argaam: disclosures",
-            is_disclosure=True,
-        )]
-        kept = market_brief.filter_items(items, WATCHLIST, MACRO_KEYWORDS)
-        assert len(kept) == 1
-        assert kept[0]["rank"] == "disclosure"
-        assert "Saudi National Bank" in kept[0]["matched"]
-
     def test_news_only_names_are_matched_like_any_other(self):
         wl = config._watchlist_entries([
-            {"name": "Commercial International Bank",
-             "aliases": ["COMI", "التجاري الدولي"], "market": "egx", "news_only": True},
-            {"name": "Abu Qir Fertilizers", "aliases": ["ABUK", "أبو قير"],
-             "market": "egx", "news_only": True},
+            {"name": "OpenAI", "aliases": ["ChatGPT"], "market": "us",
+             "news_only": True},
         ])
-        items = [
-            _item("COMI posts higher net income"),
-            _item("أبو قير للأسمدة تعلن نتائجها"),
-        ]
+        items = [_item("OpenAI signs data-center deal")]
         kept = market_brief.filter_items(items, wl, MACRO_KEYWORDS)
-        assert len(kept) == 2
-        assert all(i["rank"] == "ticker" for i in kept)
-
-    def test_fertilizer_macro_keywords_match(self):
-        keywords = ["urea", "أسمدة"]
-        items = [
-            _item("Urea prices climb on export curbs"),
-            _item("ارتفاع أسعار أسمدة اليوريا"),
-        ]
-        kept = market_brief.filter_items(items, [], keywords)
-        assert len(kept) == 2
-
-    def test_arabic_term_matches_with_the_attached_definite_article(self):
-        """The press writes "الأسمدة", never the bare "أسمدة" — ال is glued on."""
-        items = [_item("ارتفاع أسعار الأسمدة عالميا")]
-        assert len(market_brief.filter_items(items, [], ["أسمدة"])) == 1
+        assert len(kept) == 1
+        assert kept[0]["rank"] == "ticker"
 
     def test_caps_at_max_items(self):
-        items = [_item(f"Fawry story {i}") for i in range(30)]
+        items = [_item(f"TSMC story {i}") for i in range(30)]
         kept = market_brief.filter_items(items, WATCHLIST, MACRO_KEYWORDS, max_items=5)
         assert len(kept) == 5
 
     def test_empty_watchlist_still_keeps_macro(self):
-        items = [_item("CBE holds rates"), _item("Fawry results")]
+        items = [_item("Fed rate cut expected"), _item("TSMC results")]
         kept = market_brief.filter_items(items, [], MACRO_KEYWORDS)
         assert len(kept) == 1
         assert kept[0]["rank"] == "macro"
@@ -408,13 +428,13 @@ class TestPrices:
     def test_change_percent_and_no_flag_below_threshold(self):
         resp = _mock_response("", payload=_chart_payload([100.0, 101.0]))
         with patch("httpx.get", return_value=resp):
-            q = market_brief.fetch_quote("1180.SR")
+            q = market_brief.fetch_quote("AVGO")
         assert q["ok"] is True
         assert q["last"] == 101.0
         assert q["prev"] == 100.0
         assert q["change_pct"] == 1.0
         assert q["flagged"] is False
-        assert q["currency"] == "SAR"
+        assert q["currency"] == "USD"
 
     def test_flags_move_at_or_above_two_percent(self):
         resp = _mock_response("", payload=_chart_payload([100.0, 97.5]))
@@ -433,21 +453,21 @@ class TestPrices:
 
     def test_threshold_table(self):
         assert market_brief.move_threshold("VWRA.L") == 1.0
-        assert market_brief.move_threshold("9404.SR") == 1.0
-        assert market_brief.move_threshold("1180.SR") == 2.0
+        assert market_brief.move_threshold("TSM") == 2.0
+        assert market_brief.move_threshold("AVGO") == 2.0
 
     def test_nulls_in_closes_are_ignored(self):
         resp = _mock_response("", payload=_chart_payload([None, 50.0, None, 55.0]))
         with patch("httpx.get", return_value=resp):
-            q = market_brief.fetch_quote("EGS745L1C014.CA")
+            q = market_brief.fetch_quote("NVDA")
         assert q["ok"] is True
         assert q["change_pct"] == 10.0
 
     def test_unknown_symbol_is_tolerated(self):
-        """A wrong EGX symbol must degrade, never crash the brief."""
+        """A wrong symbol must degrade, never crash the brief."""
         resp = _mock_response("", payload={"chart": {"result": None, "error": "Not Found"}})
         with patch("httpx.get", return_value=resp):
-            q = market_brief.fetch_quote("EFIH.CA")
+            q = market_brief.fetch_quote("WRONG")
         assert q["ok"] is False
         assert q["change_pct"] is None
 
@@ -462,15 +482,26 @@ class TestPrices:
             q = market_brief.fetch_quote("TSM")
         assert q["ok"] is False
 
+    def test_single_close_falls_back_to_meta_marks(self):
+        """Thinly traded listings can return one bar; the meta block still
+        carries both closes."""
+        payload = _chart_payload([42.0])
+        payload["chart"]["result"][0]["meta"].update(
+            {"regularMarketPrice": 42.0, "chartPreviousClose": 40.0}
+        )
+        resp = _mock_response("", payload=payload)
+        with patch("httpx.get", return_value=resp):
+            q = market_brief.fetch_quote("THIN.L")
+        assert q["ok"] is True
+        assert q["change_pct"] == 5.0
+
     def test_news_only_entries_are_never_priced(self):
-        """A guessed EGX symbol would print a confident number for the wrong
+        """A guessed symbol would print a confident number for the wrong
         instrument — worse than no number at all."""
         wl = [
             {"symbol": "TSM", "name": "TSMC", "aliases": [], "news_only": False},
-            {"symbol": "", "name": "Commercial International Bank",
-             "aliases": ["COMI"], "news_only": True},
-            {"symbol": "EFIH.CA", "name": "e-Finance",
-             "aliases": ["EFIH"], "news_only": True},
+            {"symbol": "", "name": "OpenAI", "aliases": ["ChatGPT"], "news_only": True},
+            {"symbol": "GUESS", "name": "Guessed Co", "aliases": [], "news_only": True},
         ]
         resp = _mock_response("", payload=_chart_payload([10.0, 11.0]))
         with patch("httpx.get", return_value=resp) as mock_get:
@@ -484,12 +515,12 @@ class TestPrices:
         with patch("httpx.get", return_value=resp):
             prices = market_brief.fetch_prices(WATCHLIST)
         assert len(prices) == len(WATCHLIST)
-        assert prices[0]["name"] == "Saudi National Bank"
-        assert prices[0]["market"] == "tadawul"
+        assert prices[0]["name"] == "TSMC"
+        assert prices[0]["market"] == "us"
 
     def test_unavailable_price_is_labelled(self):
         text = market_brief.format_prices([
-            {"symbol": "EFIH.CA", "name": "e-Finance", "ok": False, "watch_only": True},
+            {"symbol": "WRONG", "name": "Guessed Co", "ok": False, "watch_only": True},
         ])
         assert "price unavailable" in text
 
@@ -514,7 +545,7 @@ class TestComposeBrief:
     async def test_uses_claude_output_when_clean(self, payload, watchlist_config):
         prices, items = payload
         runner = MagicMock()
-        runner.run = AsyncMock(return_value=("*📊 موجز السوق*\nTSMC closed +5.3%.", None))
+        runner.run = AsyncMock(return_value=("*📊 Market brief*\nTSMC closed +5.3%.", None))
 
         brief, used_claude = await market_brief.compose_brief(prices, items, runner)
 
@@ -556,7 +587,7 @@ class TestComposeBrief:
         deny every tool."""
         prices, items = payload
         runner = MagicMock()
-        runner.run = AsyncMock(return_value=("*📊 موجز السوق*\nok", None))
+        runner.run = AsyncMock(return_value=("*📊 Market brief*\nok", None))
 
         await market_brief.compose_brief(prices, items, runner)
 
@@ -600,6 +631,38 @@ class TestComposeBrief:
         assert "TSMC beats estimates" in prompt
         assert runner.run.call_args.kwargs["max_turns"] == 6
         assert runner.run.call_args.kwargs["model"] == config.COMPOSE_MODEL
+
+    @pytest.mark.asyncio
+    async def test_radar_reaches_the_prompt_as_observation_not_tip(
+        self, payload, watchlist_config
+    ):
+        """Radar names are market-wide activity, not picks. The block must be
+        present, framed as data, and fenced by the same no-advice guardrail."""
+        prices, items = payload
+        radar = [{"symbol": "SMCI", "name": "Super Micro", "change_pct": 11.4,
+                  "sources": ["day gainers", "trending"]}]
+        runner = MagicMock()
+        runner.run = AsyncMock(return_value=("ok", None))
+
+        await market_brief.compose_brief(prices, items, runner, radar=radar)
+
+        prompt = runner.run.call_args[0][0]
+        lowered = prompt.lower()
+        assert "SMCI" in prompt
+        assert "+11.40% today" in prompt
+        assert "not holdings and not" in lowered
+        assert "never frame any of them as a pick" in lowered
+
+    @pytest.mark.asyncio
+    async def test_empty_radar_says_nothing_notable(self, payload, watchlist_config):
+        prices, items = payload
+        runner = MagicMock()
+        runner.run = AsyncMock(return_value=("ok", None))
+
+        await market_brief.compose_brief(prices, items, runner, radar=[])
+
+        prompt = runner.run.call_args[0][0]
+        assert "(nothing notable)" in prompt
 
     @pytest.mark.asyncio
     async def test_smart_money_reaches_the_prompt_as_context_not_advice(
@@ -680,6 +743,21 @@ class TestComposeBrief:
         assert "Smart money" in with_events
         assert "filed 13F-HR" in with_events
 
+    def test_static_digest_includes_radar_only_when_present(self):
+        prices = [{"symbol": "TSM", "name": "TSMC", "ok": True, "last": 1.0,
+                   "prev": 1.0, "change_pct": 0.0, "currency": "USD",
+                   "flagged": False, "watch_only": False}]
+        radar = [{"symbol": "SMCI", "name": "Super Micro", "change_pct": 11.4,
+                  "sources": ["day gainers"]}]
+
+        without = market_brief.format_digest(prices, [])
+        with_radar = market_brief.format_digest(prices, [], radar=radar)
+
+        assert "Radar" not in without
+        assert "Radar" in with_radar
+        assert "SMCI" in with_radar
+        assert "not the watchlist" in with_radar
+
     def test_static_digest_reports_no_move_honestly(self):
         prices = [{"symbol": "TSM", "name": "TSMC", "ok": True, "last": 1.0,
                    "prev": 1.0, "change_pct": 0.0, "currency": "USD",
@@ -689,10 +767,10 @@ class TestComposeBrief:
         assert "No matching headlines" in text
 
 
-# ── smart-money isolation ───────────────────────────────────────────
+# ── bonus-section isolation ─────────────────────────────────────────
 
 
-class TestSmartMoneyIsolation:
+class TestBonusSectionIsolation:
     def test_scan_includes_the_smart_money_key(self, monkeypatch, seen_file,
                                                watchlist_config):
         monkeypatch.setattr(config, "today", lambda: date(2026, 8, 13))
@@ -705,7 +783,7 @@ class TestSmartMoneyIsolation:
 
     def test_a_broken_13f_check_never_breaks_the_brief(self, monkeypatch, seen_file,
                                                        watchlist_config):
-        """Quarterly bonus section — it must not be able to sink the daily job."""
+        """Quarterly bonus section — it must not be able to sink the job."""
         monkeypatch.setattr(config, "today", lambda: date(2026, 8, 13))
         monkeypatch.setattr(market_brief, "fetch_prices", lambda wl: [])
         monkeypatch.setattr(market_brief, "fetch_headlines", lambda: [])
@@ -718,6 +796,35 @@ class TestSmartMoneyIsolation:
         data = market_brief.scan()  # must not raise
         assert data["smart_money"] == []
 
+    def test_a_broken_radar_never_breaks_the_brief(self, monkeypatch, seen_file,
+                                                   watchlist_config):
+        monkeypatch.setattr(config, "today", lambda: date(2026, 8, 13))
+        monkeypatch.setattr(config, "MARKET_BRIEF_RADAR_ENABLED", True)
+        monkeypatch.setattr(market_brief, "fetch_prices", lambda wl: [])
+        monkeypatch.setattr(market_brief, "fetch_headlines", lambda: [])
+        monkeypatch.setattr("market_brief.smart_money.collect_events", lambda: [])
+
+        def boom(**kwargs):
+            raise RuntimeError("Yahoo exploded")
+
+        monkeypatch.setattr("market_brief.radar.collect", boom)
+
+        data = market_brief.scan()  # must not raise
+        assert data["radar"] == []
+
+    def test_radar_respects_the_config_switch(self, monkeypatch, seen_file,
+                                              watchlist_config):
+        monkeypatch.setattr(config, "today", lambda: date(2026, 8, 13))
+        monkeypatch.setattr(market_brief, "fetch_prices", lambda wl: [])
+        monkeypatch.setattr(market_brief, "fetch_headlines", lambda: [])
+        monkeypatch.setattr("market_brief.smart_money.collect_events", lambda: [])
+        monkeypatch.setattr(config, "MARKET_BRIEF_RADAR_ENABLED", False)
+
+        with patch("market_brief.radar.collect",
+                   side_effect=AssertionError("must not fetch")):
+            data = market_brief.scan()
+        assert data["radar"] == []
+
 
 # ── config parsing ──────────────────────────────────────────────────
 
@@ -725,22 +832,22 @@ class TestSmartMoneyIsolation:
 class TestWatchlistConfig:
     def test_normalises_a_yaml_watchlist(self):
         raw = [
-            {"symbol": "1180.SR", "name": "Saudi National Bank",
-             "aliases": ["SNB", "الأهلي السعودي"], "market": "tadawul"},
-            {"symbol": "EFIH.CA", "name": "e-Finance", "aliases": ["EFIH"],
-             "market": "egx", "watch_only": True},
+            {"symbol": "TSM", "name": "TSMC",
+             "aliases": ["Taiwan Semiconductor"], "market": "us"},
+            {"symbol": "NVDA", "name": "NVIDIA", "aliases": ["Nvidia"],
+             "market": "us", "watch_only": True},
         ]
         out = config._watchlist_entries(raw)
 
         assert len(out) == 2
-        assert out[0]["symbol"] == "1180.SR"
-        assert out[0]["aliases"] == ["SNB", "الأهلي السعودي"]  # Arabic kept verbatim
+        assert out[0]["symbol"] == "TSM"
+        assert out[0]["aliases"] == ["Taiwan Semiconductor"]
         assert out[0]["watch_only"] is False
         assert out[1]["watch_only"] is True
 
     def test_entry_without_symbol_becomes_news_only(self):
         out = config._watchlist_entries([
-            {"name": "Commercial International Bank", "aliases": ["COMI"], "market": "egx"},
+            {"name": "OpenAI", "aliases": ["ChatGPT"], "market": "us"},
             {"symbol": "TSM"},
         ])
         assert len(out) == 2
@@ -750,7 +857,7 @@ class TestWatchlistConfig:
 
     def test_explicit_news_only_flag_is_honoured(self):
         out = config._watchlist_entries([
-            {"symbol": "EFIH.CA", "name": "e-Finance", "news_only": True},
+            {"symbol": "GUESS", "name": "Guessed Co", "news_only": True},
         ])
         assert out[0]["news_only"] is True
 
@@ -766,25 +873,35 @@ class TestWatchlistConfig:
         assert out[0]["aliases"] == ["TSMC"]
 
     def test_non_list_and_non_dict_are_ignored(self):
-        assert config._watchlist_entries("1180.SR") == []
+        assert config._watchlist_entries("TSM") == []
         assert config._watchlist_entries([1, 2, 3]) == []
         assert config._watchlist_entries(None) == []
 
     def test_macro_keywords_use_the_shared_trigger_list(self):
         out = config._trigger_list(
-            ["CBE", "المركزي المصري", ""], "market_brief.macro_keywords"
+            ["Fed Rate", "Treasury Yields", ""], "market_brief.macro_keywords"
         )
-        assert out == ["cbe", "المركزي المصري"]
+        assert out == ["fed rate", "treasury yields"]
 
     def test_config_exposes_the_market_brief_knobs(self):
         for name in (
-            "MARKET_BRIEF_ENABLED", "MARKET_BRIEF_SCHEDULE_TIME",
-            "MARKET_BRIEF_WATCHLIST", "MARKET_BRIEF_MACRO_KEYWORDS",
-            "MARKET_BRIEF_MAX_ITEMS",
+            "MARKET_BRIEF_ENABLED", "MARKET_BRIEF_SCHEDULE_TIMES",
+            "MARKET_BRIEF_SCHEDULE_TIME", "MARKET_BRIEF_WATCHLIST",
+            "MARKET_BRIEF_MACRO_KEYWORDS", "MARKET_BRIEF_MAX_ITEMS",
+            "MARKET_BRIEF_RADAR_ENABLED", "MARKET_BRIEF_RADAR_COUNT",
         ):
             assert hasattr(config, name), f"config.{name} is missing"
-        assert ":" in config.MARKET_BRIEF_SCHEDULE_TIME
+        assert all(":" in t for t in config.MARKET_BRIEF_SCHEDULE_TIMES)
+        assert config.MARKET_BRIEF_SCHEDULE_TIME == config.MARKET_BRIEF_SCHEDULE_TIMES[0]
 
     def test_schedule_time_survives_a_sexagesimal_yaml_int(self):
         """Unquoted `08:00` in YAML parses as int 480 — must degrade, not crash."""
         assert config._parse_hhmm(480, "08:00") == "08:00"
+
+    def test_schedule_times_accepts_a_list_and_drops_junk(self):
+        defaults = ["10:00", "18:00", "23:00"]
+        assert config._parse_schedule_times(["10:00", 480, "23:00"], defaults) == \
+            ["10:00", "23:00"]
+        assert config._parse_schedule_times(None, defaults) == defaults
+        assert config._parse_schedule_times([480], defaults) == defaults
+        assert config._parse_schedule_times("18:00", defaults) == ["18:00"]

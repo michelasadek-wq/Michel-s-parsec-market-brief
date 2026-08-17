@@ -174,6 +174,9 @@ def parse_information_table(xml_text: str) -> list[dict]:
     would be ten rows of the same two names. Values are whatever unit the filer
     used (older filings report thousands); only ranking and relative change are
     used, never an absolute dollar claim.
+
+    Share counts (``sshPrnamt``) are carried alongside value because value
+    alone cannot tell buying from a price move — see ``diff_positions``.
     """
     try:
         root = ET.fromstring(xml_text)
@@ -181,12 +184,13 @@ def parse_information_table(xml_text: str) -> list[dict]:
         logger.warning(f"Smart money: information table is not parseable XML: {e}")
         return []
 
-    totals: dict[str, float] = {}
+    totals: dict[str, dict] = {}
     for node in root.iter():
         if _local(node.tag) != "infoTable":
             continue
         issuer = ""
         value = 0.0
+        shares = 0.0
         for child in node.iter():
             lt = _local(child.tag)
             if lt == "nameOfIssuer" and child.text and not issuer:
@@ -196,43 +200,90 @@ def parse_information_table(xml_text: str) -> list[dict]:
                     value = float(child.text.strip().replace(",", ""))
                 except ValueError:
                     value = 0.0
+            elif lt == "sshPrnamt" and child.text:
+                try:
+                    shares = float(child.text.strip().replace(",", ""))
+                except ValueError:
+                    shares = 0.0
         if not issuer:
             continue
-        totals[issuer] = totals.get(issuer, 0.0) + value
+        entry = totals.setdefault(issuer, {"value": 0.0, "shares": 0.0})
+        entry["value"] += value
+        entry["shares"] += shares
 
-    return [{"issuer": k, "value": v}
-            for k, v in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)]
+    return [{"issuer": k, "value": v["value"], "shares": v["shares"]}
+            for k, v in sorted(totals.items(),
+                               key=lambda kv: kv[1]["value"], reverse=True)]
+
+
+def _metrics(entry) -> tuple[float, float | None]:
+    """(value, shares) from a position entry, tolerating every stored shape.
+
+    A baseline written by an older version is a bare number (value only); the
+    current shape is {"value": v, "shares": s}. Shares come back as None when
+    genuinely unknown so the diff can tell "no shares data" from "zero shares".
+    """
+    if isinstance(entry, dict):
+        value = float(entry.get("value", 0) or 0)
+        shares = entry.get("shares")
+        shares = float(shares) if isinstance(shares, (int, float)) else None
+        return value, shares
+    try:
+        return float(entry or 0), None
+    except (TypeError, ValueError):
+        return 0.0, None
 
 
 def diff_positions(prev: dict, curr: list[dict]) -> dict:
-    """Compare a parsed filing against the previous quarter's stored totals.
+    """Compare a parsed filing against the previous quarter's stored positions.
 
     Returns {"added": [...], "exited": [...]} — new/increased and gone/reduced
     names, biggest first. Without a baseline both lists are empty and the
     caller falls back to reporting the top holdings only.
+
+    The diff runs on SHARE COUNTS whenever both quarters carry them, and only
+    falls back to reported value (legacy baselines, filers whose share fields
+    did not parse). Value alone is misleading: a position "grows" quarter over
+    quarter just because the price rose, without the manager buying a single
+    share. Each move carries its ``basis`` so the renderer can say which
+    measure it is a fact about.
     """
     if not prev or not curr:
         return {"added": [], "exited": []}
 
-    current = {p["issuer"]: p["value"] for p in curr}
+    current = {p["issuer"]: p for p in curr}
     added, exited = [], []
 
-    for issuer, value in current.items():
-        before = float(prev.get(issuer, 0) or 0)
-        if value > before:
+    for issuer, pos in current.items():
+        value, shares = _metrics(pos)
+        prev_value, prev_shares = _metrics(prev.get(issuer))
+        in_prev = issuer in prev
+        if shares is not None and (prev_shares is not None or not in_prev):
+            basis, now_n, before_n = "shares", shares, (prev_shares or 0.0)
+        else:
+            basis, now_n, before_n = "value", value, prev_value
+        if now_n > before_n:
             added.append({
                 "issuer": issuer,
-                "delta": value - before,
-                "is_new": before == 0,
+                "delta": now_n - before_n,
+                "is_new": before_n == 0 and not in_prev,
+                "basis": basis,
             })
-    for issuer, before in prev.items():
-        value = float(current.get(issuer, 0) or 0)
-        before = float(before or 0)
-        if value < before:
+    for issuer, prev_entry in prev.items():
+        prev_value, prev_shares = _metrics(prev_entry)
+        pos = current.get(issuer)
+        # Absent from the new filing means zero on both measures, not unknown.
+        value, shares = _metrics(pos) if pos is not None else (0.0, 0.0)
+        if prev_shares is not None and shares is not None:
+            basis, now_n, before_n = "shares", shares, prev_shares
+        else:
+            basis, now_n, before_n = "value", value, prev_value
+        if now_n < before_n:
             exited.append({
                 "issuer": issuer,
-                "delta": before - value,
-                "is_gone": value == 0,
+                "delta": before_n - now_n,
+                "is_gone": now_n == 0,
+                "basis": basis,
             })
 
     added.sort(key=lambda p: p["delta"], reverse=True)
@@ -288,7 +339,11 @@ def _check_tracker(tracker: dict, state: dict, today: date) -> dict | None:
         "accession": filing["accession"],
         "filing_date": filing.get("filing_date", ""),
         "name": name,
-        "positions": {p["issuer"]: p["value"] for p in positions[:50]},
+        # Shares are stored alongside value so next quarter's diff can compare
+        # counts, not prices — see diff_positions.
+        "positions": {p["issuer"]: {"value": p["value"],
+                                    "shares": p.get("shares", 0.0)}
+                      for p in positions[:50]},
     }
 
     if first_run and stale:
@@ -392,11 +447,24 @@ def format_events(events: list[dict]) -> str:
         if top:
             names = ", ".join(_short(p["issuer"]) for p in top[:_TOP_N])
             lines.append(f"  Largest disclosed positions by value: {names}")
+        # The verb states which measure changed: a share-count change is a
+        # position change; a value-only change may be nothing but the price
+        # moving, and must not be dressed up as more than that.
         for p in e.get("added") or []:
-            verb = "newly disclosed" if p.get("is_new") else "reported larger"
+            if p.get("is_new"):
+                verb = "newly disclosed"
+            elif p.get("basis") == "shares":
+                verb = "reported a higher share count"
+            else:
+                verb = "reported a larger value (share count unavailable)"
             lines.append(f"  {_short(p['issuer'])}: {verb} vs the prior filing")
         for p in e.get("exited") or []:
-            verb = "no longer listed" if p.get("is_gone") else "reported smaller"
+            if p.get("is_gone"):
+                verb = "no longer listed"
+            elif p.get("basis") == "shares":
+                verb = "reported a lower share count"
+            else:
+                verb = "reported a smaller value (share count unavailable)"
             lines.append(f"  {_short(p['issuer'])}: {verb} vs the prior filing")
         if not top:
             lines.append(

@@ -7,18 +7,29 @@
 # targets. The watchlist below says what to WATCH, never what to do about it.
 
 # All dates (dedup TTL, 13F staleness window, the brief's own date) are
-# resolved in this timezone, not the server's. A UTC host would otherwise roll
-# the date over at 22:00 local.
+# resolved in this timezone — the reader's local time, which is also what
+# schedule_times below is written in — not the server's.
 timezone: "Africa/Cairo"
 
 market_brief:
   enabled: true
-  schedule_time: "08:00"      # quote the value — unquoted 08:00 is an int in YAML
+
+  # When a brief is meant to run, in the timezone above. Nothing in the app
+  # schedules anything — point cron / a systemd timer at these times; the
+  # config is just the single place the cadence is written down.
+  # Quote the values — unquoted 08:00 is an int in YAML.
+  schedule_times: ["10:00", "18:00", "23:00"]
+
   max_items: 25               # cap on headlines carried into one brief
 
   # Optional narrative composer. Only used when the `claude` CLI is on PATH;
   # without it every run prints the static digest, which is the real output.
   compose_model: "claude-sonnet-4-6"
+
+  # Market-wide radar: the day's biggest US gainers and most-searched tickers,
+  # reported as observed activity. Data only — never presented as picks.
+  radar_enabled: true
+  radar_count: 5
 
   # Institutional 13F watcher (SEC EDGAR). Quarterly cadence — silent on ~99%
   # of days. sec_contact goes into the User-Agent that SEC requires on every
@@ -29,37 +40,25 @@ market_brief:
 
   watchlist:
     # ── Priced entries ──────────────────────────────────────────────
-    # Quoted daily, flagged when they move past their threshold (2%, or 1% for
-    # the low-beta instruments listed in brief.py).
-    - {symbol: "1180.SR", name: "Saudi National Bank", aliases: ["SNB", "الأهلي السعودي"], market: tadawul}
-    - {symbol: "7010.SR", name: "stc", aliases: ["اس تي سي", "الاتصالات السعودية"], market: tadawul}
-    - {symbol: "9412.SR", name: "Albilad MSCI Saudi Equity ETF", aliases: ["9412"], market: tadawul}
-    - {symbol: "9404.SR", name: "Alinma Govt Sukuk ETF", aliases: ["9404"], market: tadawul}
-    # EGX symbols on Yahoo are ISIN-based — "FWRY.CA" is a DIFFERENT instrument,
-    # do not "simplify" this one. It is the only EGX symbol here that is verified.
-    - {symbol: "EGS745L1C014.CA", name: "Fawry", aliases: ["FWRY", "فوري"], market: egx}
-    - {symbol: "VWRA.L", name: "Vanguard FTSE All-World (VWRA)", aliases: ["VWRA"], market: lse}
+    # Quoted each run, flagged when they move past their threshold (2%, or 1%
+    # for the low-beta instruments listed in brief.py).
     - {symbol: "TSM", name: "TSMC", aliases: ["Taiwan Semiconductor"], market: us}
     - {symbol: "AVGO", name: "Broadcom", aliases: ["Broadcom"], market: us}
+    - {symbol: "NVDA", name: "NVIDIA", aliases: ["Nvidia"], market: us, watch_only: true}
+    - {symbol: "MSFT", name: "Microsoft", aliases: ["Microsoft"], market: us, watch_only: true}
+    - {symbol: "VWRA.L", name: "Vanguard FTSE All-World (VWRA)", aliases: ["VWRA"], market: lse}
 
     # ── News-only entries ───────────────────────────────────────────
-    # Tracked in headlines, never priced. Their Yahoo symbols are ISIN-based
-    # and unverified, and a WRONG symbol is worse than no symbol: it would
-    # print a confident number for a different instrument.
-    - {name: "e-Finance", aliases: ["EFIH", "اي فاينانس"], market: egx, news_only: true}
-    - {name: "Commercial International Bank", aliases: ["COMI", "التجاري الدولي"], market: egx, news_only: true}
-    - {name: "Abu Qir Fertilizers", aliases: ["ABUK", "أبو قير"], market: egx, news_only: true}
-    - {name: "MOPCO", aliases: ["MFPC", "موبكو"], market: egx, news_only: true}
-    - {name: "EFG Holding", aliases: ["HRHO", "اي اف چي"], market: egx, news_only: true}
-    - {name: "Talaat Moustafa Group", aliases: ["TMGH", "طلعت مصطفى"], market: egx, news_only: true}
-    - {name: "Orascom Construction", aliases: ["ORAS", "أوراسكوم"], market: egx, news_only: true}
-    - {name: "Edita Food Industries", aliases: ["EFID", "إيديتا"], market: egx, news_only: true}
-    - {name: "Oriental Weavers", aliases: ["ORWE", "النساجون الشرقيون"], market: egx, news_only: true}
+    # Tracked in headlines, never priced — for names whose symbol is unverified
+    # or unlisted. A WRONG symbol is worse than no symbol: it would print a
+    # confident number for a different instrument.
+    # - {name: "OpenAI", aliases: ["ChatGPT"], market: us, news_only: true}
 
   # Macro/policy terms. A headline matching one of these is kept even when it
   # names nothing on the watchlist, but it ranks below ticker-specific news.
-  # Matching is whole-token; Arabic terms also match with the attached ال.
-  macro_keywords: ["CBE", "المركزي المصري", "Federal Reserve", "Fed rate", "Trump tariff", "TASI", "EGX30", "interest rate Egypt", "Saudi CMA", "urea", "أسمدة"]
+  # Matching is whole-token and case-insensitive.
+  macro_keywords: ["Federal Reserve", "Fed rate", "Trump tariff", "CPI",
+                   "Treasury yields", "executive order", "rate cut", "OPEC"]
 
 # Where a finished brief goes. "console" prints it (the default, and what
 # `--once` uses). "whatsapp" targets an HTTP gateway and is a documented stub —

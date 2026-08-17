@@ -1,8 +1,8 @@
-"""Market brief — daily pre-market watchlist monitor.
+"""Market brief — a US/global watchlist monitor, run several times a day.
 
-Scans Saudi/Egypt/US/UK news feeds plus Yahoo close prices for the symbols on
-the configured watchlist, then writes a short "what moved · what changed · what
-to ignore" digest.
+Scans US and global news feeds plus Yahoo close prices for the symbols on the
+configured watchlist, adds a market-wide radar (day gainers, trending tickers),
+then writes a short "what moved · what changed · what to ignore" digest.
 
 MONITORING ONLY. This module never produces investment advice: the compose
 prompt forbids buy/sell/hold calls, price targets, and conviction language, and
@@ -40,7 +40,7 @@ _SEEN_TTL_DAYS = 14
 #: prompt so a story that resurfaces under a new headline is not re-reported.
 _BRIEFS_DIR = config.DATA_DIR / "briefs"
 
-# Every fetch goes out with a browser UA + Accept. Argaam and Google News both
+# Every fetch goes out with a browser UA + Accept. Google News and Yahoo both
 # serve junk (or nothing) to a default client UA.
 _HTTP_HEADERS = {
     "User-Agent": (
@@ -54,35 +54,28 @@ _HTTP_TIMEOUT = 15
 
 # News sources — (label, url, is_disclosure, require_xml).
 #
-# `is_disclosure` marks the regulator-filing feed; those items outrank ordinary
-# coverage in the candidate pool. `require_xml` marks feeds that answer a bad
-# path with a 200 + HTML page instead of an error: Argaam does exactly that, so
-# its content-type is asserted before parsing rather than letting ElementTree
-# fail on a <!DOCTYPE html> body and look like a transient outage.
+# `is_disclosure` marks regulator-filing feeds; those items outrank ordinary
+# coverage in the candidate pool (none of the current feeds carries it — SEC
+# filings arrive through the smart-money watcher instead). `require_xml` marks
+# feeds that answer a bad path with a 200 + HTML page instead of an error;
+# such a feed gets its content-type asserted before parsing rather than
+# letting ElementTree fail on a <!DOCTYPE html> body and look like a
+# transient outage.
 FEEDS = [
-    ("Argaam: disclosures",
-     "https://www.argaam.com/en/rss/ho-company-disclosures?sectionid=244",
-     True, True),
-    ("Argaam: market news",
-     "https://www.argaam.com/en/rss/ho-main-news?sectionid=1524",
-     False, True),
-    ("Google News: Tadawul",
-     'https://news.google.com/rss/search?q="تداول" OR "السوق السعودي" when:1d'
-     "&hl=ar&gl=SA&ceid=SA:ar",
-     False, False),
-    ("Google News: EGX",
-     'https://news.google.com/rss/search?q=Fawry OR "فوري" OR EGX when:2d'
-     "&hl=en-EG&gl=EG&ceid=EG:en",
+    ("Google News: US markets",
+     'https://news.google.com/rss/search?q="Wall Street" OR Nasdaq OR '
+     '"Dow Jones" when:1d&hl=en-US&gl=US&ceid=US:en',
      False, False),
     ("Google News: macro",
      'https://news.google.com/rss/search?q=Trump tariff OR "executive order" '
      "market OR Fed rate when:1d&hl=en-US&gl=US&ceid=US:en",
      False, False),
-    ("Google News: CBE",
-     'https://news.google.com/rss/search?q="المركزي المصري" OR "البنك المركزي" '
-     "فائدة when:2d&hl=ar&gl=EG&ceid=EG:ar",
+    ("CNBC: markets",
+     "https://www.cnbc.com/id/100003114/device/rss/rss.html",
      False, False),
-    ("EnterpriseAM", "https://enterpriseam.com/feed/", False, False),
+    ("MarketWatch: top stories",
+     "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+     False, False),
     ("Yahoo: TSM", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSM",
      False, False),
     ("Yahoo: AVGO", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AVGO",
@@ -100,7 +93,7 @@ _YAHOO_CHART_URL = (
 # move, so a 2% gate would mean they never appear at all.
 _MOVE_THRESHOLD_DEFAULT = 2.0
 _MOVE_THRESHOLD_LOW_BETA = 1.0
-_LOW_BETA_SYMBOLS = {"VWRA.L", "9404.SR"}
+_LOW_BETA_SYMBOLS = {"VWRA.L"}
 
 # Candidate-pool ordering: a regulator filing about a held name beats press
 # coverage of it, which beats macro/policy background.
@@ -268,38 +261,25 @@ def _entry_terms(entry: dict) -> list[str]:
     """Every string that means "this watchlist entry" — symbol, name, aliases."""
     terms = [str(entry.get("symbol", "")), str(entry.get("name", ""))]
     terms += [str(a) for a in entry.get("aliases", [])]
-    # The bare ticker root ("1180.SR" → "1180") is how the Arabic press writes
-    # a Tadawul name, and how the ETF entries are aliased.
+    # The bare ticker root ("VWRA.L" → "VWRA") is how the press writes a
+    # non-US listing, without the exchange suffix.
     symbol = str(entry.get("symbol", ""))
     if "." in symbol:
         terms.append(symbol.split(".")[0])
     return [t.strip() for t in terms if t and t.strip()]
 
 
-#: Arabic block — used to decide whether the definite article may prefix a term.
-_ARABIC_CHAR = re.compile(r"[؀-ۿ]")
-
-
 def _matches(term: str, haystack: str) -> bool:
     """Whole-token, case-insensitive match of `term` inside `haystack`.
 
-    A plain substring test is wrong here: the watchlist carries three- and
-    four-character names ("stc", "SNB", "9404") that occur inside ordinary
-    words and numbers, and every false positive costs a slot in a capped brief.
-    Lookarounds rather than \\b so terms ending in punctuation ("1180.SR") still
-    anchor correctly. Arabic is unaffected by IGNORECASE and matches literally.
-
-    Arabic terms additionally accept the attached definite article: the press
-    writes "الأسمدة", never the bare "أسمدة", and ال is glued to the word so a
-    token boundary alone would miss every real headline. Optional, so a term
-    already carrying it ("المركزي المصري") still matches as written.
+    A plain substring test is wrong here: the watchlist carries short names
+    and tickers ("TSM", "ARM"-like) that occur inside ordinary words, and
+    every false positive costs a slot in a capped brief. Lookarounds rather
+    than \\b so terms ending in punctuation ("VWRA.L") still anchor correctly.
     """
     if not term:
         return False
-    core = re.escape(term)
-    if _ARABIC_CHAR.match(term):
-        core = r"(?:ال)?" + core
-    pattern = r"(?<!\w)" + core + r"(?!\w)"
+    pattern = r"(?<!\w)" + re.escape(term) + r"(?!\w)"
     return re.search(pattern, haystack, re.IGNORECASE) is not None
 
 
@@ -308,10 +288,9 @@ def filter_items(items: list[dict], watchlist: list[dict],
                  max_items: int = 25) -> list[dict]:
     """Keep only items about a watchlist name or a macro keyword, then rank.
 
-    Matching is whole-token and case-insensitive on title + summary, and covers
-    Arabic aliases (which match literally). Ranking is disclosures first, then
-    ticker-specific coverage, then macro/policy background, so the cap trims the
-    least specific items.
+    Matching is whole-token and case-insensitive on title + summary. Ranking
+    is disclosures first, then ticker-specific coverage, then macro/policy
+    background, so the cap trims the least specific items.
     """
     kept = []
     keywords = [str(k).strip() for k in macro_keywords if str(k).strip()]
@@ -352,8 +331,7 @@ def fetch_quote(symbol: str) -> dict:
     """Last close vs previous close for one symbol via Yahoo's chart endpoint.
 
     Never raises: a delisted/renamed/unknown symbol comes back as ``ok: False``
-    and the brief prints "price unavailable" for it. EGX symbols are the ones
-    most likely to be wrong — on Yahoo they are ISIN-based, not ticker-based.
+    and the brief prints "price unavailable" for it.
     """
     quote = {
         "symbol": symbol,
@@ -386,8 +364,8 @@ def fetch_quote(symbol: str) -> dict:
         if len(closes) >= 2:
             last, prev = closes[-1], closes[-2]
         else:
-            # EGX symbols return a single bar regardless of range; the meta
-            # block still carries both marks (verified live for EGS745L1C014.CA).
+            # Thinly traded symbols can return a single bar regardless of
+            # range; the meta block still carries both marks.
             last, prev = meta.get("regularMarketPrice"), meta.get("chartPreviousClose")
             if not (isinstance(last, (int, float)) and isinstance(prev, (int, float))):
                 logger.info(f"Market brief: fewer than 2 closes for {symbol}")
@@ -411,7 +389,7 @@ def fetch_prices(watchlist: list[dict]) -> list[dict]:
     """Quotes for every PRICED watchlist entry, each independently fault-tolerant.
 
     News-only entries are skipped outright — they exist to be matched in
-    headlines, and their Yahoo symbols are unverified. Quoting a guessed symbol
+    headlines, and their symbols are unverified. Quoting a guessed symbol
     would print a confident number for the wrong instrument, which is worse
     than printing nothing.
     """
@@ -432,7 +410,7 @@ def fetch_smart_money() -> list[dict]:
     """13F events, if any. Total: any failure means "nothing new" and no more.
 
     Isolated behind its own try/except because it is a bonus section on a
-    quarterly cadence — the daily brief must never be delayed or lost because
+    quarterly cadence — the brief must never be delayed or lost because
     the SEC endpoint was slow, moved, or served something unexpected.
     """
     try:
@@ -443,8 +421,32 @@ def fetch_smart_money() -> list[dict]:
         return []
 
 
+def fetch_radar() -> list[dict]:
+    """Market-wide radar (day gainers, trending), if enabled. Total: [] on failure.
+
+    Same isolation contract as the smart-money section: the radar is a bonus,
+    and losing it must never cost the watchlist part of the brief.
+    """
+    if not config.MARKET_BRIEF_RADAR_ENABLED:
+        return []
+    try:
+        from . import radar
+        return radar.collect(quote_fn=fetch_quote,
+                             count=config.MARKET_BRIEF_RADAR_COUNT)
+    except Exception:
+        logger.exception("Market brief: radar check failed — continuing without it")
+        return []
+
+
 def scan() -> dict:
-    """Fetch prices + new (unseen) matching headlines + 13F events. Synchronous."""
+    """Fetch prices + new (unseen) matching headlines + radar + 13F events.
+
+    Synchronous, and deliberately WITHOUT persisting the seen-set: the headlines
+    consumed here are only really "reported" once a brief is delivered, so the
+    caller (run_scan_and_notify) saves the returned ``seen`` dict after
+    delivery. Saving here would mean a run that crashes between scan and send
+    silently eats that slot's headlines for the TTL window.
+    """
     watchlist = config.MARKET_BRIEF_WATCHLIST
     seen = _load_seen()
     today = config.today().isoformat()
@@ -459,16 +461,17 @@ def scan() -> dict:
         config.MARKET_BRIEF_MACRO_KEYWORDS,
         max_items=config.MARKET_BRIEF_MAX_ITEMS,
     )
-    _save_seen(seen)
 
     smart = fetch_smart_money()
+    radar_entries = fetch_radar()
 
     logger.info(
         f"Market brief scan: {len(items)} relevant items "
         f"(of {len(fresh)} new / {len(raw)} raw), {len(prices)} quotes, "
-        f"{len(smart)} 13F event(s)"
+        f"{len(radar_entries)} radar name(s), {len(smart)} 13F event(s)"
     )
-    return {"prices": prices, "items": items, "smart_money": smart}
+    return {"prices": prices, "items": items, "smart_money": smart,
+            "radar": radar_entries, "seen": seen}
 
 
 def format_prices(prices: list[dict]) -> str:
@@ -507,7 +510,8 @@ def items_to_text(items: list[dict]) -> str:
 
 
 def format_digest(prices: list[dict], items: list[dict],
-                  max_items: int = 6, smart_money: list[dict] | None = None) -> str:
+                  max_items: int = 6, smart_money: list[dict] | None = None,
+                  radar: list[dict] | None = None) -> str:
     """Static fallback digest — used when no composer is available.
 
     Deliberately a plain data dump: no interpretation at all, so the fallback
@@ -522,6 +526,13 @@ def format_digest(prices: list[dict], items: list[dict],
     else:
         lines.append("_No watchlist move past its threshold._")
     lines.append("")
+
+    # Market-wide activity, as data. Observed, not endorsed.
+    if radar:
+        from . import radar as _radar
+        lines.append("*Radar* (market-wide activity, not the watchlist)")
+        lines.append(_radar.format_radar(radar))
+        lines.append("")
 
     # Only present when a filing actually landed — on ~99% of days, absent.
     if smart_money:
@@ -546,9 +557,10 @@ def format_digest(prices: list[dict], items: list[dict],
 
 
 MARKET_BRIEF_PROMPT = """\
-You are writing the *daily pre-market brief* — a short message for one person, \
-about the instruments he already holds or watches. He wants situational \
-awareness before the market opens: what moved, what changed, what to ignore.
+You are writing the *market brief* — a short message for one person, about \
+the instruments they already hold or watch, plus a radar of market-wide \
+activity. It runs a few times a day; they want situational awareness: what \
+moved, what changed, what to ignore.
 
 ABSOLUTE GUARDRAIL — this is a MONITORING brief, never advice:
 - NEVER write a buy, sell, hold, add, trim, exit, or "take profit" call, in any wording.
@@ -569,6 +581,14 @@ PRICES (last close vs previous close; ⚠︎ marks a move past its threshold):
 HEADLINES matched to those names or to macro/policy keywords:
 {items}
 
+MARKET RADAR — names showing unusual market-wide activity right now (biggest \
+day gainers, most-searched tickers). These are NOT holdings and NOT \
+suggestions: they answer "what is the market chasing today", nothing more. \
+Report at most 3 as observed activity ("X rose n% today"), attach a reason \
+only if a headline above supplies one, and never frame any of them as a pick, \
+an opportunity, or something to act on:
+{radar}
+
 SMART MONEY — institutional 13F filings disclosed since the last brief. These \
 are BACKWARD-LOOKING regulatory disclosures of what a manager held at a past \
 quarter end, published with a delay of up to 45 days. Report them as facts that \
@@ -580,11 +600,14 @@ RECENT BRIEFS (do not repeat these — same story, same angle = skip):
 {recent_briefs}
 
 Write it like this:
-- First line: `*📊 موجز السوق*` then the date.
+- First line: `*📊 Market brief*` then the date.
 - Lead with the single most important thing that happened, one or two lines.
-- Then short bullets grouped by market (Tadawul, EGX, US, Global) — only the \
-markets that actually have something. One line each: what moved or what changed, \
-and the one fact behind it.
+- Then short bullets grouped by market (US, Global) — only the groups that \
+actually have something. One line each: what moved or what changed, and the \
+one fact behind it.
+- If the MARKET RADAR block has content, add one `*Radar:*` line — up to 3 \
+names with their day moves, observed activity only. If it says "(nothing \
+notable)", omit the line.
 - If, and ONLY if, the SMART MONEY block above has content, add one short \
 `*Smart money:*` line stating what was filed. If it says "(nothing new)", omit \
 the section entirely — do not mention 13Fs, do not say it was quiet.
@@ -594,7 +617,7 @@ one line.
 News-only names have no price at all — cover them from headlines only.
 - English, terse, factual. Chat formatting (*bold*, - bullets), no markdown \
 headers, no emojis beyond the header. AT MOST 20 lines and under 1300 characters.
-- A quiet day is a short brief. Do not pad.
+- A quiet stretch is a short brief. Do not pad.
 """
 
 
@@ -650,8 +673,9 @@ def archive_brief(text: str, day: str = "") -> None:
 
 async def compose_brief(prices: list[dict], items: list[dict],
                         claude_runner,
-                        smart_money: list[dict] | None = None) -> tuple[str, bool]:
-    """Compose the brief text from prices + filtered headlines.
+                        smart_money: list[dict] | None = None,
+                        radar: list[dict] | None = None) -> tuple[str, bool]:
+    """Compose the brief text from prices + filtered headlines + radar.
 
     Returns (brief_text, used_model); falls back to the static digest when no
     composer is configured, when it fails, or when it hands back anything that
@@ -660,11 +684,13 @@ async def compose_brief(prices: list[dict], items: list[dict],
     brief = ""
     used_claude = False
     if claude_runner:
+        from . import radar as _radar
         from . import smart_money as _sm
         prompt = MARKET_BRIEF_PROMPT.format(
             portfolio=_portfolio_text(config.MARKET_BRIEF_WATCHLIST) or "(none)",
             prices=format_prices(prices) or "(no prices available)",
             items=items_to_text(items) or "(no matching headlines)",
+            radar=_radar.format_radar(radar or []) or "(nothing notable)",
             smart_money=_sm.format_events(smart_money or []) or "(nothing new)",
             recent_briefs=_recent_briefs_text() or "(none)",
         )
@@ -701,7 +727,7 @@ async def compose_brief(prices: list[dict], items: list[dict],
             )
 
     if not brief:
-        brief = format_digest(prices, items, smart_money=smart_money)
+        brief = format_digest(prices, items, smart_money=smart_money, radar=radar)
     return brief, used_claude
 
 
@@ -712,25 +738,33 @@ async def run_scan_and_notify(sender=None, claude_runner=None) -> str:
     otherwise), and `claude_runner` to the `claude` CLI if it is installed. A
     delivery failure is logged, not raised: the brief is still archived and
     still returned to the caller.
+
+    The seen-set is persisted HERE, at the end, not inside scan(): a run that
+    dies mid-pipeline must not consume its headlines — they should surface
+    again on the next run instead of vanishing into the TTL window unreported.
     """
     if sender is None:
         from . import senders
         sender = senders.get_sender(config.DELIVERY_BACKEND, **config.DELIVERY_OPTIONS)
 
     # scan() does blocking HTTP — run in a thread so an async caller keeps its
-    # event loop while ~9 feeds and ~9 quotes are fetched.
+    # event loop while the feeds and quotes are fetched.
     data = await asyncio.to_thread(scan)
     prices, items = data["prices"], data["items"]
     smart = data.get("smart_money") or []
+    radar_entries = data.get("radar") or []
+    seen = data.get("seen") or {}
     if not prices and not items and not smart:
         logger.info("Market brief: nothing to report today")
+        _save_seen(seen)
         return ""
 
     brief, used_claude = await compose_brief(
-        prices, items, claude_runner, smart_money=smart,
+        prices, items, claude_runner, smart_money=smart, radar=radar_entries,
     )
     if not brief:
         logger.warning("Market brief: composed an empty brief — not sending")
+        _save_seen(seen)
         return ""
 
     try:
@@ -739,8 +773,10 @@ async def run_scan_and_notify(sender=None, claude_runner=None) -> str:
         logger.warning(f"Market brief: delivery failed: {e}")
 
     archive_brief(brief)
+    _save_seen(seen)
     logger.info(
         f"Market brief: {'composed' if used_claude else 'static'} brief "
-        f"({len(items)} items, {len(prices)} quotes, {len(smart)} 13F event(s))"
+        f"({len(items)} items, {len(prices)} quotes, "
+        f"{len(radar_entries)} radar name(s), {len(smart)} 13F event(s))"
     )
     return brief

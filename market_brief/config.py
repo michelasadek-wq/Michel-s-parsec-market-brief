@@ -90,6 +90,28 @@ def _parse_hhmm(value, default: str = "08:00") -> str:
     return s
 
 
+def _parse_schedule_times(raw, defaults: list[str]) -> list[str]:
+    """Normalise ``schedule_times`` to a list of 'HH:MM' strings.
+
+    Accepts a list or a single value (string or the sexagesimal-int YAML trap,
+    per _parse_hhmm). Invalid entries degrade to nothing rather than crashing;
+    an empty result falls back to the defaults so the schedule never silently
+    becomes "never".
+    """
+    if raw is None:
+        return list(defaults)
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    out = []
+    for value in raw:
+        s = str(value).strip()
+        if ":" in s:
+            out.append(s)
+        else:
+            logger.warning(f"Invalid schedule_times entry {value!r}; skipping it")
+    return out or list(defaults)
+
+
 def _trigger_list(raw, label: str) -> list[str]:
     """Normalise a configured keyword list: strings, stripped, lower-cased.
 
@@ -115,14 +137,14 @@ def _watchlist_entries(raw, label: str = "market_brief.watchlist") -> list[dict]
     Two kinds of entry are valid:
       * priced — has a `symbol`, gets a quote and can be flagged as a mover;
       * news-only — has a `name` (and usually aliases) but no tradeable symbol
-        we trust. EGX names are the case: their Yahoo symbols are ISIN-based
-        and easy to get wrong, and a wrong symbol is worse than no symbol.
-        `news_only: true` also forces this for an entry that HAS a symbol.
+        we trust: a wrong symbol is worse than no symbol, it prints a confident
+        number for a different instrument. `news_only: true` also forces this
+        for an entry that HAS a symbol.
     An entry with neither symbol nor name means nothing at all and is dropped
     with a warning rather than crashing the scan later.
 
-    Aliases are kept as written — Arabic aliases must survive verbatim, so
-    nothing here lower-cases them; matching casefolds at compare time instead.
+    Aliases are kept as written — matching is case-insensitive at compare
+    time, so nothing here lower-cases them.
     """
     out: list[dict] = []
     if not isinstance(raw, (list, tuple)):
@@ -184,8 +206,10 @@ def _tracker_entries(raw, label: str = "market_brief.trackers") -> list[dict]:
 # ── time ────────────────────────────────────────────────────────────
 
 #: All dates in this app — the seen-set TTL, the 13F staleness window, the
-#: brief's own date — are market-local, not server-local. A UTC host would
-#: otherwise roll the date over at 22:00 local and dedupe against "tomorrow".
+#: brief's own date — are resolved in this timezone (the reader's local time,
+#: which is also what schedule_times is written in), not the server's. A UTC
+#: host would otherwise roll the date at the wrong hour and dedupe against
+#: "tomorrow".
 _DEFAULT_TIMEZONE = "Africa/Cairo"
 TIMEZONE: str = str(_cfg.get("timezone", _DEFAULT_TIMEZONE)).strip() or _DEFAULT_TIMEZONE
 
@@ -230,14 +254,30 @@ if not isinstance(_market_cfg, dict):
     _market_cfg = {}
 
 MARKET_BRIEF_ENABLED: bool = bool(_market_cfg.get("enabled", False))
-MARKET_BRIEF_SCHEDULE_TIME: str = _parse_hhmm(
-    _market_cfg.get("schedule_time", "08:00"), "08:00"
+
+#: The times of day (in TIMEZONE) a brief is meant to run. Nothing in this
+#: package schedules anything — cron or a systemd timer does — but the config
+#: is the single place the cadence is written down.
+_DEFAULT_SCHEDULE_TIMES = ["10:00", "18:00", "23:00"]
+MARKET_BRIEF_SCHEDULE_TIMES: list[str] = _parse_schedule_times(
+    _market_cfg.get("schedule_times",
+                    _market_cfg.get("schedule_time")),  # older configs, singular
+    _DEFAULT_SCHEDULE_TIMES,
 )
+#: Backward-compatible singular view: the first scheduled time.
+MARKET_BRIEF_SCHEDULE_TIME: str = MARKET_BRIEF_SCHEDULE_TIMES[0]
+
 MARKET_BRIEF_WATCHLIST: list[dict] = _watchlist_entries(_market_cfg.get("watchlist", []))
 MARKET_BRIEF_MACRO_KEYWORDS: list[str] = _trigger_list(
     _market_cfg.get("macro_keywords", []), "market_brief.macro_keywords"
 )
 MARKET_BRIEF_MAX_ITEMS: int = int(_market_cfg.get("max_items", 25))
+
+#: Market-wide radar (day gainers + trending tickers). Data only — the compose
+#: prompt forbids presenting any radar name as a pick. Defaults on; costs a
+#: couple of Yahoo requests per run.
+MARKET_BRIEF_RADAR_ENABLED: bool = bool(_market_cfg.get("radar_enabled", True))
+MARKET_BRIEF_RADAR_COUNT: int = int(_market_cfg.get("radar_count", 5))
 
 # Institutional 13F trackers (SEC EDGAR). Quarterly cadence, so this is nearly
 # always a no-op. SEC blocks requests without a contact address in the

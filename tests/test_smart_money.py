@@ -35,13 +35,18 @@ def _submissions(forms_and_dates: list[tuple[str, str, str]]) -> dict:
     }
 
 
-def _info_table(rows: list[tuple[str, float]]) -> str:
-    """Build a 13F information table from (issuer, value) pairs."""
+def _info_table(rows: list[tuple[str, float]], shares: dict | None = None) -> str:
+    """Build a 13F information table from (issuer, value) pairs.
+
+    Share counts default to the value (fine for most tests); pass ``shares``
+    to give an issuer a different count, e.g. to model a pure price move.
+    """
+    shares = shares or {}
     body = "".join(
         f"<infoTable><nameOfIssuer>{n}</nameOfIssuer>"
         f"<titleOfClass>COM</titleOfClass><cusip>00000000{i}</cusip>"
         f"<value>{int(v)}</value>"
-        f"<shrsOrPrnAmt><sshPrnamt>{int(v)}</sshPrnamt>"
+        f"<shrsOrPrnAmt><sshPrnamt>{int(shares.get(n, v))}</sshPrnamt>"
         f"<sshPrnamtType>SH</sshPrnamtType></shrsOrPrnAmt>"
         f"<investmentDiscretion>SOLE</investmentDiscretion>"
         f"</infoTable>"
@@ -147,12 +152,19 @@ class TestParseInformationTable:
         assert [p["issuer"] for p in positions] == ["COCA COLA CO", "APPLE INC"]
         assert positions[0]["value"] == 3000
 
+    def test_carries_share_counts(self):
+        """Shares ride alongside value — they are what the diff runs on."""
+        xml = _info_table([("APPLE INC", 1000)], shares={"APPLE INC": 250})
+        positions = smart_money.parse_information_table(xml)
+        assert positions[0]["shares"] == 250.0
+
     def test_aggregates_duplicate_issuer_rows(self):
         """One issuer spans several rows (share classes, sub-managers)."""
         xml = _info_table([("APPLE INC", 500), ("APPLE INC", 700), ("KRAFT", 100)])
         positions = smart_money.parse_information_table(xml)
         assert len(positions) == 2
-        assert positions[0] == {"issuer": "APPLE INC", "value": 1200.0}
+        assert positions[0] == {"issuer": "APPLE INC", "value": 1200.0,
+                                "shares": 1200.0}
 
     def test_html_or_garbage_returns_empty(self):
         assert smart_money.parse_information_table("<!DOCTYPE html><html></html>") == []
@@ -173,13 +185,44 @@ class TestParseInformationTable:
             "<infoTable><nameOfIssuer>ODD CO</nameOfIssuer><value>n/a</value></infoTable>"
             "</informationTable>"
         )
-        assert smart_money.parse_information_table(xml) == [{"issuer": "ODD CO", "value": 0.0}]
+        assert smart_money.parse_information_table(xml) == [
+            {"issuer": "ODD CO", "value": 0.0, "shares": 0.0}
+        ]
 
 
 # ── diffing ─────────────────────────────────────────────────────────
 
 
 class TestDiffPositions:
+    def test_price_appreciation_alone_is_not_an_add(self):
+        """The whole point of diffing shares: value up, shares flat = the
+        price moved, the manager did nothing. Must not be reported."""
+        prev = {"APPLE INC": {"value": 1000, "shares": 100}}
+        curr = [{"issuer": "APPLE INC", "value": 1500, "shares": 100}]
+        assert smart_money.diff_positions(prev, curr) == {"added": [], "exited": []}
+
+    def test_share_count_changes_are_reported_with_their_basis(self):
+        prev = {"APPLE INC": {"value": 1000, "shares": 100},
+                "KRAFT": {"value": 500, "shares": 50}}
+        curr = [{"issuer": "APPLE INC", "value": 900, "shares": 120},  # bought, price fell
+                {"issuer": "KRAFT", "value": 600, "shares": 40}]      # sold, price rose
+        moves = smart_money.diff_positions(prev, curr)
+
+        added = {p["issuer"]: p for p in moves["added"]}
+        exited = {p["issuer"]: p for p in moves["exited"]}
+        assert added["APPLE INC"]["delta"] == 20
+        assert added["APPLE INC"]["basis"] == "shares"
+        assert exited["KRAFT"]["delta"] == 10
+        assert exited["KRAFT"]["basis"] == "shares"
+
+    def test_legacy_value_only_baseline_falls_back_to_value(self):
+        """A baseline written by the previous version stores bare values —
+        the diff must still work, on value, and say so via basis."""
+        prev = {"APPLE INC": 1000}
+        curr = [{"issuer": "APPLE INC", "value": 1500, "shares": 100}]
+        moves = smart_money.diff_positions(prev, curr)
+        assert moves["added"][0]["basis"] == "value"
+
     def test_detects_new_and_increased_positions(self):
         prev = {"APPLE INC": 1000, "KRAFT": 500}
         curr = [{"issuer": "APPLE INC", "value": 1500},
@@ -364,6 +407,21 @@ class TestFormatEvents:
         assert "newly disclosed" in text
         assert "no longer listed" in text
         assert event["url"] in text
+
+    def test_verbs_state_which_measure_changed(self, event):
+        """A share-count change is a position change; a value-only change may
+        be nothing but the price moving — the wording must keep them apart."""
+        event["added"] = [
+            {"issuer": "MORE CO", "delta": 10, "is_new": False, "basis": "shares"},
+            {"issuer": "VAGUE CO", "delta": 100, "is_new": False, "basis": "value"},
+        ]
+        event["exited"] = [
+            {"issuer": "LESS CO", "delta": 10, "is_gone": False, "basis": "shares"},
+        ]
+        text = smart_money.format_events([event])
+        assert "MORE CO: reported a higher share count" in text
+        assert "VAGUE CO: reported a larger value (share count unavailable)" in text
+        assert "LESS CO: reported a lower share count" in text
 
     def test_never_uses_imperative_or_advice_language(self, event):
         text = smart_money.format_events([event]).lower()
