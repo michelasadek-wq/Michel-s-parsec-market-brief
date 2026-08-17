@@ -210,7 +210,7 @@ def _tracker_entries(raw, label: str = "market_brief.trackers") -> list[dict]:
 #: which is also what schedule_times is written in), not the server's. A UTC
 #: host would otherwise roll the date at the wrong hour and dedupe against
 #: "tomorrow".
-_DEFAULT_TIMEZONE = "Africa/Cairo"
+_DEFAULT_TIMEZONE = "Asia/Dubai"
 TIMEZONE: str = str(_cfg.get("timezone", _DEFAULT_TIMEZONE)).strip() or _DEFAULT_TIMEZONE
 
 

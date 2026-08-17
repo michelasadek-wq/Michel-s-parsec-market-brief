@@ -9,7 +9,7 @@
 # All dates (dedup TTL, 13F staleness window, the brief's own date) are
 # resolved in this timezone — the reader's local time, which is also what
 # schedule_times below is written in — not the server's.
-timezone: "Africa/Cairo"
+timezone: "Asia/Dubai"
 
 market_brief:
   enabled: true

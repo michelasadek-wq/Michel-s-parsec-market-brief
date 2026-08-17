@@ -138,10 +138,10 @@ pytest          # 119 tests, no network — every fetch is mocked
 The intended cadence is three runs a day — a pre-US-open view, a mid-session
 view, and an after-close view. `schedule_times` in config.yaml records the
 cadence (in the configured timezone); cron actually enforces it. For the
-default `10:00 / 18:00 / 23:00` in `Africa/Cairo` (UTC+3 in summer):
+default `10:00 / 18:00 / 23:00` in `Asia/Dubai` (UTC+4, no DST):
 
 ```cron
-0 7,15,20 * * *  cd /path/to/parsec-market-brief && python -m market_brief --once
+0 6,14,19 * * *  cd /path/to/parsec-market-brief && python -m market_brief --once
 ```
 
 ### Configuration
